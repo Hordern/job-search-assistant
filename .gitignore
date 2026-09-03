@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+job_pipeline.sqlite
+reports/
+raw_emails/
+cv_scoring_full.txt

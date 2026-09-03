@@ -1,0 +1,4 @@
+imapclient
+beautifulsoup4
+anthropic
+python-dotenv
