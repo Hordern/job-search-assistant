@@ -3,6 +3,8 @@ venv/
 __pycache__/
 *.pyc
 job_pipeline.sqlite
+jobs.db
+.ingest.lock
 reports/
 raw_emails/
 cv_scoring_full.txt

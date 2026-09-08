@@ -1,4 +1,8 @@
-imapclient
-beautifulsoup4
+fastapi
+uvicorn
 anthropic
 python-dotenv
+requests
+# Retained for the existing job_digest.py utility.
+imapclient
+beautifulsoup4
