@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 anthropic
+openai
 python-dotenv
 requests
-# Retained for the existing job_digest.py utility.
-imapclient
 beautifulsoup4
+python-jobspy

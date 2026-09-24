@@ -6,9 +6,9 @@ import imaplib
 import os
 import re
 import ssl
+from datetime import date
 from email import message_from_bytes
 from email.message import Message
-from pathlib import Path
 from urllib.parse import urlparse
 
 import anthropic
@@ -21,10 +21,11 @@ from db import (
     link_email_job, log_event, mark_email_moved, mark_email_processed, save_job,
     start_ingestion_run,
 )
-from scorer import score_job
+from profile import ENV_PATH, PROFILE_DIR
+from scorer import load_prefs, score_job
 from version import build_version
 
-load_dotenv()
+load_dotenv(ENV_PATH)
 
 VERSION = build_version("1.2.0")
 
@@ -34,8 +35,16 @@ LINK_PATTERNS = {
 }
 
 # SEEK alert emails never contain a direct seek.com.au/job/ID link — every link is a
-# click-tracking redirect through this domain that must be followed to find one.
+# click-tracking redirect that must be followed to find one. SEEK has sent these
+# through both email.s.seek.com.au and, as of Sep 2026, a SendGrid click-tracking
+# domain whose account-specific subdomain (observed: u45457511) can change — match
+# the stable .ct.sendgrid.net suffix rather than the exact hostname.
 SEEK_TRACKING_HOSTS = {"email.s.seek.com.au"}
+SEEK_TRACKING_HOST_SUFFIXES = (".ct.sendgrid.net",)
+
+
+def _is_seek_tracking_host(host: str) -> bool:
+    return host in SEEK_TRACKING_HOSTS or host.endswith(SEEK_TRACKING_HOST_SUFFIXES)
 
 
 def _resolve_seek_redirect(url: str) -> str | None:
@@ -57,10 +66,19 @@ JOB_PAGE_HEADERS = {
 }
 
 
-def _fetch_seek_description(url: str) -> str | None:
+_SEEK_POSTED_RE = re.compile(r"\bPosted\s+[\w\s]{1,20}?\bago\b", re.IGNORECASE)
+
+
+def fetch_seek_description(url: str) -> dict[str, str | None] | None:
     """Fetch the full ad text from a SEEK job page. Alert emails only ever
     contain title/company/location/salary — this is what lets scoring see
-    actual duties and requirements instead of guessing from a thin preview."""
+    actual duties and requirements instead of guessing from a thin preview.
+
+    Returns {"description": str, "date_posted": str | None} — SEEK doesn't
+    expose a structured posting date anywhere (checked: no JobPosting
+    JSON-LD, no data-automation date tag) so this is a best-effort text
+    match on the page's own "Posted Xh ago" wording, which is real but
+    fragile — None if it isn't found rather than a guess."""
     try:
         response = requests.get(url, headers=JOB_PAGE_HEADERS, timeout=15)
         response.raise_for_status()
@@ -71,7 +89,10 @@ def _fetch_seek_description(url: str) -> str | None:
     if not details:
         return None
     text = details.get_text(" ", strip=True)
-    return text[:12000] if text else None
+    if not text:
+        return None
+    posted_match = _SEEK_POSTED_RE.search(soup.get_text(" ", strip=True))
+    return {"description": text[:12000], "date_posted": posted_match.group(0) if posted_match else None}
 
 
 def _html_from_message(message: Message) -> str:
@@ -83,7 +104,7 @@ def _html_from_message(message: Message) -> str:
     return ""
 
 
-def _fingerprint(company: str, title: str, location: str) -> str:
+def fingerprint(company: str, title: str, location: str) -> str:
     value = f"{company.strip().lower()}{title.strip().lower()}{location.strip().lower()}"
     return hashlib.md5(value.encode("utf-8")).hexdigest()
 
@@ -118,7 +139,7 @@ def _extract_jobs(html: str) -> list[dict[str, str]]:
         href = a["href"]
         url = href
         host = (urlparse(href).hostname or "").lower()
-        if host in SEEK_TRACKING_HOSTS:
+        if _is_seek_tracking_host(host):
             if href not in resolved_cache:
                 resolved_cache[href] = _resolve_seek_redirect(href)
             resolved = resolved_cache[href]
@@ -227,13 +248,26 @@ def ingest_alerts() -> dict[str, int]:
     folder = os.environ.get("IMAP_FOLDER", "INBOX")
     run_id = start_ingestion_run(folder, VERSION)
     log_event(run_id, "info", f"Starting run against {folder} (worker {VERSION})")
+    search_criteria = "ALL"
+    emails_since = load_prefs().get("emails_since")
+    if emails_since:
+        # Filtered server-side by the IMAP SINCE search term — not fetched
+        # then discarded client-side. Matters here: a mailbox with tens of
+        # thousands of older messages (e.g. a personal inbox repurposed for
+        # job alerts) would otherwise force every single message through
+        # is_email_processed() and a body fetch on the very first run.
+        imap_date = date.fromisoformat(emails_since).strftime("%d-%b-%Y")
+        search_criteria = f'(SINCE "{imap_date}")'
+        log_event_prefix = f"Only considering emails on/after {emails_since}"
     try:
         with imaplib.IMAP4_SSL(imap_server) as mail:
             mail.login(imap_user, imap_pass)
             status, _ = mail.select(folder, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"Unable to select IMAP folder {folder!r}")
-            status, data = mail.uid("search", None, "ALL")
+            if emails_since:
+                log_event(run_id, "info", log_event_prefix)
+            status, data = mail.uid("search", None, search_criteria)
             if status != "OK":
                 raise RuntimeError("Unable to search IMAP folder")
 
@@ -262,7 +296,7 @@ def ingest_alerts() -> dict[str, int]:
                     counts["job_links_found"] += len(jobs)
                     log_event(run_id, "info", f"UID {uid}: {len(jobs)} job link(s) found")
                     for job in jobs:
-                        job["fingerprint"] = _fingerprint(job["company"], job["title"], job["location"])
+                        job["fingerprint"] = fingerprint(job["company"], job["title"], job["location"])
                         existing_job_id = get_job_id(job["canonical_id"], job["fingerprint"])
                         if existing_job_id is not None:
                             counts["duplicates"] += 1
@@ -270,9 +304,11 @@ def ingest_alerts() -> dict[str, int]:
                             continue
                         full_description = None
                         if job["platform"] == "seek":
-                            full_description = _fetch_seek_description(job["url"])
-                            if full_description:
+                            seek_result = fetch_seek_description(job["url"])
+                            if seek_result:
+                                full_description = seek_result["description"]
                                 job["raw_description"] = full_description
+                                job["date_posted"] = seek_result["date_posted"]
 
                         if not full_description:
                             # No real description available — scoring on title/company
@@ -357,7 +393,7 @@ def ingest_alerts() -> dict[str, int]:
     return counts
 
 
-LOCK_PATH = Path(__file__).with_name(".ingest.lock")
+LOCK_PATH = PROFILE_DIR / ".ingest.lock"
 
 
 if __name__ == "__main__":

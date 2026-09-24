@@ -4,10 +4,11 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator
 
-DB_PATH = Path(__file__).with_name("jobs.db")
+from profile import PROFILE_DIR
+
+DB_PATH = PROFILE_DIR / "jobs.db"
 
 
 @contextmanager
@@ -93,6 +94,14 @@ def init_db() -> None:
             "ALTER TABLE ingestion_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'done'",
             "ALTER TABLE ingestion_runs ADD COLUMN finished_at TIMESTAMP",
             "ALTER TABLE processed_emails ADD COLUMN moved_to TEXT",
+            # Date the listing was actually posted, not when we saw it — "age of
+            # listing" badge. Free text (not a strict date type): SEEK gives a
+            # relative string ("Posted 22h ago"), Indeed/LinkedIn give an ISO
+            # date via JobSpy. NULL where the source doesn't expose it at all.
+            "ALTER TABLE jobs ADD COLUMN date_posted TEXT",
+            # Favourite/star flag — independent of status (a NEW or
+            # TO_PROCESS job can be starred without changing its workflow state).
+            "ALTER TABLE jobs ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 conn.execute(statement)
@@ -140,8 +149,8 @@ def save_job(job_dict: dict[str, Any]) -> int | None:
             """
             INSERT OR IGNORE INTO jobs (
                 canonical_id, fingerprint, platform, title, company, location,
-                url, raw_description, ai_evaluation, overall_score, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                url, raw_description, ai_evaluation, overall_score, status, created_at, date_posted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_dict["canonical_id"], job_dict["fingerprint"], job_dict["platform"],
@@ -150,9 +159,23 @@ def save_job(job_dict: dict[str, Any]) -> int | None:
                 json.dumps(evaluation) if evaluation is not None else None,
                 job_dict.get("overall_score"), job_dict.get("status", "NEW"),
                 job_dict.get("created_at", datetime.now(timezone.utc).isoformat()),
+                job_dict.get("date_posted"),
             ),
         )
         return cursor.lastrowid if cursor.rowcount == 1 else None
+
+
+def toggle_favorite(job_id: int) -> bool | None:
+    """Flip the favourite flag. Returns the new state, or None if the job
+    doesn't exist — kept independent of `status` so starring never disturbs
+    a job's NEW/TO_PROCESS/APPLIED workflow position."""
+    with connection() as conn:
+        row = conn.execute("SELECT favorited FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        new_value = 0 if row["favorited"] else 1
+        conn.execute("UPDATE jobs SET favorited = ? WHERE id = ?", (new_value, job_id))
+        return bool(new_value)
 
 
 def link_email_job(uid: int, job_id: int) -> None:
