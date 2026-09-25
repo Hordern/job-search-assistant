@@ -23,12 +23,13 @@ from pydantic import BaseModel
 from commute import get_commute
 from db import (
     connection, get_job_id, init_db, latest_ingestion_run, latest_ingestion_run_for_email,
-    latest_ingestion_run_for_search, run_events, save_job, search_term_stats, toggle_favorite,
+    latest_ingestion_run_for_search, record_click, run_events, save_job, search_term_stats,
+    toggle_favorite,
 )
 from ingest import fetch_seek_description, fingerprint
 from profile import PROFILE, PROFILE_DIR
 import scorer
-from scorer import load_prefs, score_job
+from scorer import PREFS_PATH, load_prefs, score_job
 from version import build_version
 
 VERSION = build_version("1.2.0")
@@ -63,6 +64,11 @@ class JobAction(BaseModel):
 
 class FavoritePayload(BaseModel):
     job_id: int
+
+
+class TermSuggestionApplyPayload(BaseModel):
+    add_terms: list[str] = []
+    remove_terms: list[str] = []
 
 
 class RescorePayload(BaseModel):
@@ -244,7 +250,7 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     <div><p class="text-sm font-semibold text-emerald-700">Strengths</p><ul class="ml-5 list-disc text-sm text-slate-600">{positives_html}</ul></div>
     <div><p class="text-sm font-semibold text-slate-700">Gaps</p><ul class="ml-5 list-disc text-sm text-slate-600">{gap_html}</ul></div>
   </div>
-  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer">View</a>{buttons_html}{rescore_button}</div>
+  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer" onclick="trackClick({row['id']})">View</a>{buttons_html}{rescore_button}</div>
 </article>'''
 
 
@@ -260,7 +266,7 @@ def _unscored_card(row: sqlite3.Row, buttons_html: str) -> str:
   <div class="flex items-start justify-between gap-4"><div><h2 class="text-lg font-bold">{html.escape(row['title'] or '')}</h2><p class="text-slate-600">{html.escape(row['company'] or '')}</p></div><span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500">Not scored</span></div>
   <p class="mt-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{html.escape(str(row['platform'] or ''))} · {html.escape(status_label)}</p>
   <p class="mt-3 text-sm text-slate-500">{html.escape(hint)}</p>
-  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer">View</a>{buttons_html}</div>
+  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer" onclick="trackClick({row['id']})">View</a>{buttons_html}</div>
 </article>'''
 
 
@@ -400,11 +406,31 @@ def _search_status() -> tuple[str, str, bool]:
     return checked_text, detail, is_stale
 
 
+TERM_SUGGESTIONS_PATH = PROFILE_DIR / "term_suggestions.json"
+
+
+def _term_suggestions() -> dict | None:
+    """Written by term_review.py's daily run — never generated or edited by
+    this process, only read and (via /term-suggestions/apply) cleared."""
+    if not TERM_SUGGESTIONS_PATH.exists():
+        return None
+    try:
+        return json.loads(TERM_SUGGESTIONS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 # Shared by the main dashboard's <script> block and the single-job page
 # (/job/{id}) — every card, wherever it's rendered, wires its buttons to
 # these same functions. Plain (non-f) string: no Python substitution
 # needed, so braces are single, not doubled.
 CARD_ACTIONS_JS = """
+function trackClick(job_id) {
+  // Fire-and-forget — must never delay or block the actual navigation to
+  // the job posting (target="_blank" already opens it in a new tab
+  // regardless of whether this succeeds).
+  try { navigator.sendBeacon('/click/' + job_id); } catch (e) { /* best-effort */ }
+}
 async function act(job_id, action) {
   const r = await fetch('/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id, action})});
   if (!r.ok) return alert('Could not update job');
@@ -698,6 +724,18 @@ def home() -> str:
         f"⚠ No search in over {SEARCH_STALE_THRESHOLD_MINUTES} min — search-ingest may be stuck or the launchd job isn't running"
         if search_is_stale else "Healthy — searching every 30 min"
     )
+    suggestions = _term_suggestions()
+    has_term_suggestions = bool(suggestions and suggestions.get("has_suggestions"))
+    term_suggestion_html = ""
+    if has_term_suggestions:
+        n_changes = len(suggestions.get("add_terms") or []) + len(suggestions.get("remove_terms") or [])
+        term_suggestion_html = (
+            f'<a href="/term-suggestions" class="mb-6 block rounded-2xl bg-amber-50 border border-amber-300 p-5 hover:bg-amber-100">'
+            f'<p class="text-xs font-semibold uppercase tracking-wide text-amber-700">Search preferences review · {n_changes} suggested change(s)</p>'
+            f'<p class="mt-1 text-sm text-amber-900">{html.escape(suggestions.get("summary") or "")}</p>'
+            f'<p class="mt-2 text-xs font-semibold text-amber-700">Click to review, edit and apply &rarr;</p>'
+            f'</a>'
+        )
     run = latest_ingestion_run()
     is_running = bool(run and run["status"] == "running")
     stat_tile = lambda label, value: (
@@ -711,7 +749,7 @@ def home() -> str:
         stat_tile("Discarded", counts.get("DISCARDED", 0)),
         stat_tile("Declined", counts.get("DECLINED", 0)),
     ])
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-indigo-100 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-indigo-900">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-indigo-300"></span><span class="text-xs font-normal text-indigo-500">Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><button id="source-filter-toggle" onclick="cycleSourceFilter()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">All sources</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked (email) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="{search_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{search_dot_class}"></span>Last searched (active search) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(search_checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(search_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(search_detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-indigo-100 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-indigo-900">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-indigo-300"></span><span class="text-xs font-normal text-indigo-500">Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><button id="source-filter-toggle" onclick="cycleSourceFilter()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">All sources</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header>{term_suggestion_html}<div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked (email) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="{search_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{search_dot_class}"></span>Last searched (active search) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(search_checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(search_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(search_detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
 {CARD_ACTIONS_JS}
 async function resync() {{
   const r = await fetch('/resync', {{method:'POST'}});
@@ -829,6 +867,16 @@ def favorite(payload: FavoritePayload) -> dict:
     return {"ok": True, "favorited": new_state}
 
 
+@app.post("/click/{job_id}")
+def click(job_id: int) -> dict:
+    """Fired by sendBeacon when 'View' is clicked — signal for the daily
+    search-term review, not a workflow action, so it never raises even for
+    an unknown id (a beacon send has no way to show the user an error
+    anyway)."""
+    record_click(job_id)
+    return {"ok": True}
+
+
 @app.post("/rescore")
 def rescore(payload: RescorePayload) -> dict:
     """Re-score a job with a full description pulled from the poster's own
@@ -940,6 +988,102 @@ def export_applied_csv() -> Response:
         content=buffer.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=jobhunter_applied.csv"},
     )
+
+
+@app.get("/term-suggestions", response_class=HTMLResponse)
+def term_suggestions_page() -> str:
+    """Detail view for the amber banner on the dashboard — full reasoning
+    from the daily term_review.py run, with each suggested change editable
+    (or excludable) before applying. Read-only until /term-suggestions/apply
+    is actually submitted."""
+    suggestions = _term_suggestions()
+    if not suggestions or not suggestions.get("has_suggestions"):
+        return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — search preferences review</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8">
+<a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
+<p class="mt-4 rounded-xl bg-white p-5 text-slate-500 shadow">No suggestions right now.</p>
+</main></body></html>'''
+
+    generated_at = suggestions.get("generated_at", "")
+    add_rows = "".join(
+        f'''<div class="flex items-start gap-3 rounded-lg border border-slate-200 p-3">
+<input type="checkbox" checked data-role="add" class="mt-1" value="{html.escape(t['term'])}">
+<div class="flex-1"><input type="text" value="{html.escape(t['term'])}" data-role="add-text" class="w-full rounded border border-slate-300 px-2 py-1 text-sm font-medium">
+<p class="mt-1 text-xs text-slate-500">{html.escape(t.get('reason', ''))}</p></div>
+</div>'''
+        for t in (suggestions.get("add_terms") or [])
+    ) or '<p class="text-sm text-slate-500">No additions suggested.</p>'
+    remove_rows = "".join(
+        f'''<div class="flex items-start gap-3 rounded-lg border border-slate-200 p-3">
+<input type="checkbox" checked data-role="remove" class="mt-1" value="{html.escape(t['term'])}">
+<div class="flex-1"><p class="text-sm font-medium">{html.escape(t['term'])}</p>
+<p class="mt-1 text-xs text-slate-500">{html.escape(t.get('reason', ''))}</p></div>
+</div>'''
+        for t in (suggestions.get("remove_terms") or [])
+    ) or '<p class="text-sm text-slate-500">No removals suggested.</p>'
+
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — search preferences review</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8">
+<a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
+<h1 class="mt-2 text-2xl font-bold tracking-tight">Search preferences review</h1>
+<p class="mt-1 text-xs text-slate-500">Generated {html.escape(generated_at)}</p>
+<p class="mt-3 rounded-xl bg-amber-50 border border-amber-200 p-4 text-sm text-amber-900">{html.escape(suggestions.get("summary", ""))}</p>
+
+<h2 class="mt-6 text-lg font-semibold text-emerald-700">Suggested additions</h2>
+<div class="mt-2 space-y-2">{add_rows}</div>
+
+<h2 class="mt-6 text-lg font-semibold text-red-700">Suggested removals</h2>
+<div class="mt-2 space-y-2">{remove_rows}</div>
+
+<div class="mt-6 flex gap-2">
+<button onclick="applyTermChanges()" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white">Apply selected changes</button>
+<button onclick="dismissTermChanges()" class="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium">Dismiss</button>
+</div>
+<p id="apply-status" class="mt-3 text-sm"></p>
+</main>
+<script>
+async function applyTermChanges() {{
+  const addTerms = Array.from(document.querySelectorAll('[data-role="add"]:checked')).map(cb => {{
+    const row = cb.closest('div.flex');
+    return row.querySelector('[data-role="add-text"]').value.trim();
+  }}).filter(Boolean);
+  const removeTerms = Array.from(document.querySelectorAll('[data-role="remove"]:checked')).map(cb => cb.value);
+  const status = document.getElementById('apply-status');
+  status.textContent = 'Applying…';
+  const r = await fetch('/term-suggestions/apply', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{add_terms: addTerms, remove_terms: removeTerms}})}});
+  if (!r.ok) {{ status.textContent = 'Failed to apply changes.'; return; }}
+  status.textContent = 'Applied — redirecting…';
+  location.href = '/search-terms';
+}}
+async function dismissTermChanges() {{
+  await fetch('/term-suggestions/apply', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{add_terms: [], remove_terms: []}})}});
+  location.href = '/';
+}}
+</script>
+</body></html>'''
+
+
+@app.post("/term-suggestions/apply")
+def term_suggestions_apply(payload: TermSuggestionApplyPayload) -> dict:
+    """Applies the (possibly edited) selected changes to every connector's
+    search_terms symmetrically, then clears the suggestion file either way
+    — dismiss is just an apply with empty lists."""
+    if payload.add_terms or payload.remove_terms:
+        prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+        connectors = prefs.get("connectors") or {}
+        for platform in ("linkedin", "indeed", "glassdoor"):
+            config = connectors.get(platform)
+            if not config or "search_terms" not in config:
+                continue
+            terms = [t for t in config["search_terms"] if t not in payload.remove_terms]
+            for term in payload.add_terms:
+                if term not in terms:
+                    terms.append(term)
+            config["search_terms"] = terms
+        PREFS_PATH.write_text(json.dumps(prefs, indent=2) + "\n", encoding="utf-8")
+        scorer._prefs = None  # force a fresh read next time anything loads prefs
+
+    if TERM_SUGGESTIONS_PATH.exists():
+        TERM_SUGGESTIONS_PATH.unlink()
+    return {"ok": True}
 
 
 @app.get("/search-terms", response_class=HTMLResponse)

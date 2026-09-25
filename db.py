@@ -113,6 +113,12 @@ def init_db() -> None:
             # spot ones that are only surfacing noise. NULL for email-sourced
             # jobs and any search jobs saved before this column existed.
             "ALTER TABLE jobs ADD COLUMN search_term TEXT",
+            # How many times "View" was clicked, and when last — a job the
+            # user opened but never Kept/Discarded is still a real interest
+            # signal for search-term review, distinct from the explicit
+            # Keep/Discard/Applied/Favourite actions.
+            "ALTER TABLE jobs ADD COLUMN click_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN last_clicked_at TIMESTAMP",
         ):
             try:
                 conn.execute(statement)
@@ -234,6 +240,17 @@ def toggle_favorite(job_id: int) -> bool | None:
         new_value = 0 if row["favorited"] else 1
         conn.execute("UPDATE jobs SET favorited = ? WHERE id = ?", (new_value, job_id))
         return bool(new_value)
+
+
+def record_click(job_id: int) -> None:
+    """Fire-and-forget signal that 'View' was clicked — best-effort, never
+    raises on a missing job (a stale card, a race with deletion) since this
+    must never block the user's actual navigation to the job posting."""
+    with connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET click_count = click_count + 1, last_clicked_at = datetime('now') WHERE id = ?",
+            (job_id,),
+        )
 
 
 def link_email_job(uid: int, job_id: int) -> None:
