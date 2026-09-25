@@ -444,5 +444,5 @@ if __name__ == "__main__":
     except BlockingIOError:
         print("Another ingest run is already in progress — skipping.")
     else:
-        print(f"JobHunter worker {VERSION}")
+        print(f"Job Search Assistant worker {VERSION}")
         print(ingest_alerts())

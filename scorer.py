@@ -1,4 +1,4 @@
-"""Anthropic-backed job scoring for JobHunter.
+"""Anthropic-backed job scoring for Job Search Assistant.
 
 Three-pass design:
 

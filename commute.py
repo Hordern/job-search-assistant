@@ -25,7 +25,7 @@ CACHE_PATH = PROFILE_DIR / "commute_cache.json"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim's usage policy requires an identifying User-Agent and roughly
 # 1 request/second max — cached lookups never hit this, only new places do.
-USER_AGENT = "JobHunterPersonalJobSearchTool/1.0 (personal use, not for redistribution)"
+USER_AGENT = "JobSearchAssistantPersonalTool/1.0 (personal use, not for redistribution)"
 _MIN_REQUEST_INTERVAL_S = 1.1
 
 _cache: dict[str, Any] | None = None

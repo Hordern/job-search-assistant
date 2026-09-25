@@ -1,4 +1,4 @@
-"""Mobile-friendly FastAPI dashboard for JobHunter."""
+"""Mobile-friendly FastAPI dashboard for Job Search Assistant."""
 
 import csv
 import html
@@ -41,7 +41,7 @@ INGEST_SCRIPT = Path(__file__).with_name("ingest.py")
 # launchd service actually binds; defaults to 8000 (Alice's).
 DASHBOARD_PORT = os.environ.get("DASHBOARD_PORT", "8000")
 
-app = FastAPI(title=f"JobHunter v{VERSION} — {PROFILE}")
+app = FastAPI(title=f"Job Search Assistant v{VERSION} — {PROFILE}")
 init_db()
 
 # Scoped narrowly to LinkedIn — the /rescore bookmarklet runs in the context
@@ -380,13 +380,13 @@ def _dashboard_data() -> tuple[dict[str, int], str, str, bool]:
 # receiver is same-origin with this app, so its POST is permitted.
 RESCORE_BOOKMARKLET_JS = """(function(){
 var m = location.href.match(/jobs\\/view\\/(\\d+)/);
-if(!m){alert('JobHunter: open a LinkedIn job page first');return;}
+if(!m){alert('Job Search Assistant: open a LinkedIn job page first');return;}
 var id = 'linkedin_' + m[1];
 var sels = ['.jobs-description__content','.jobs-box__html-content','#job-details','[class*="jobs-description"]','article'];
 var el = null;
 for (var i=0;i<sels.length;i++){ el = document.querySelector(sels[i]); if (el && el.innerText && el.innerText.length > 200) break; else el = null; }
 var text = (el ? el.innerText : document.body.innerText).slice(0, 12000);
-if(!confirm('JobHunter: send ' + text.length + ' characters to rescore this job?\\n\\n' + text.slice(0,300) + '...')) return;
+if(!confirm('Job Search Assistant: send ' + text.length + ' characters to rescore this job?\\n\\n' + text.slice(0,300) + '...')) return;
 var receiver = 'http://127.0.0.1:__DASHBOARD_PORT__/rescore-bookmarklet#' + encodeURIComponent(JSON.stringify({canonical_id:id, raw_description:text}));
 var popup = window.open(receiver, 'jobhunter-rescore', 'popup,width=480,height=360');
 if(!popup) location.href = receiver;
@@ -396,9 +396,9 @@ RESCORE_BOOKMARKLET_HREF = "javascript:" + quote(RESCORE_BOOKMARKLET_JS.replace(
 
 RESCORE_RECEIVER_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JobHunter rescore</title>
+<title>Job Search Assistant rescore</title>
 <style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5;color:#0f172a}#status{padding:1rem;border-radius:.75rem;background:#f1f5f9}.error{background:#fef2f2!important;color:#991b1b}.success{background:#ecfdf5!important;color:#047857}</style>
-</head><body><h1>JobHunter</h1><p id="status">Sending the LinkedIn job description for scoring…</p>
+</head><body><h1>Job Search Assistant</h1><p id="status">Sending the LinkedIn job description for scoring…</p>
 <script>
 (async function () {
   var status = document.getElementById('status');
@@ -412,7 +412,7 @@ RESCORE_RECEIVER_HTML = """<!doctype html>
     var response = await fetch('/rescore', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     var data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Unknown error');
-    status.textContent = 'Rescored: ' + data.overall_score + '/100 (' + data.recommendation + '). You can close this window and refresh JobHunter.';
+    status.textContent = 'Rescored: ' + data.overall_score + '/100 (' + data.recommendation + '). You can close this window and refresh Job Search Assistant.';
     status.className = 'success';
   } catch (error) {
     status.textContent = 'Scoring failed: ' + error.message;
@@ -455,8 +455,8 @@ if (singleMatch) {
     });
   });
 }
-if (!jobs.length) { alert('JobHunter: no SEEK job(s) found on this page. Open a SEEK job page or search results page first.'); return; }
-if (!confirm('JobHunter: add ' + jobs.length + ' SEEK job(s) to the tracker?\\n\\n' + jobs.slice(0,5).map(function(j){return j.title + ' — ' + j.company;}).join('\\n') + (jobs.length > 5 ? '\\n...' : ''))) return;
+if (!jobs.length) { alert('Job Search Assistant: no SEEK job(s) found on this page. Open a SEEK job page or search results page first.'); return; }
+if (!confirm('Job Search Assistant: add ' + jobs.length + ' SEEK job(s) to the tracker?\\n\\n' + jobs.slice(0,5).map(function(j){return j.title + ' — ' + j.company;}).join('\\n') + (jobs.length > 5 ? '\\n...' : ''))) return;
 var receiver = 'http://127.0.0.1:__DASHBOARD_PORT__/add-seek-bookmarklet#' + encodeURIComponent(JSON.stringify({jobs: jobs}));
 var popup = window.open(receiver, 'jobhunter-add-seek', 'popup,width=480,height=420');
 if(!popup) location.href = receiver;
@@ -466,9 +466,9 @@ ADD_SEEK_BOOKMARKLET_HREF = "javascript:" + quote(ADD_SEEK_BOOKMARKLET_JS.replac
 
 ADD_SEEK_RECEIVER_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JobHunter add from SEEK</title>
+<title>Job Search Assistant add from SEEK</title>
 <style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5;color:#0f172a}#status{padding:1rem;border-radius:.75rem;background:#f1f5f9}.error{background:#fef2f2!important;color:#991b1b}.success{background:#ecfdf5!important;color:#047857}ul{padding-left:1.2rem}</style>
-</head><body><h1>JobHunter</h1><p id="status">Adding SEEK job(s) — fetching full listings and scoring, this can take a little while…</p>
+</head><body><h1>Job Search Assistant</h1><p id="status">Adding SEEK job(s) — fetching full listings and scoring, this can take a little while…</p>
 <script>
 (async function () {
   var status = document.getElementById('status');
@@ -483,7 +483,7 @@ ADD_SEEK_RECEIVER_HTML = """<!doctype html>
     var data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Unknown error');
     var list = data.jobs.map(function(j){ return '<li>' + j.title + (j.score !== null ? ' — ' + j.score + '/100' : ' — unscored (fetch failed)') + '</li>'; }).join('');
-    status.innerHTML = 'Added ' + data.added + ' job(s), ' + data.duplicates + ' already tracked.' + (list ? '<ul>' + list + '</ul>' : '') + 'You can close this window and refresh JobHunter.';
+    status.innerHTML = 'Added ' + data.added + ' job(s), ' + data.duplicates + ' already tracked.' + (list ? '<ul>' + list + '</ul>' : '') + 'You can close this window and refresh Job Search Assistant.';
     status.className = 'success';
   } catch (error) {
     status.textContent = 'Adding failed: ' + error.message;
@@ -506,7 +506,7 @@ ADD_SEEK_RECEIVER_HTML = """<!doctype html>
 # degrades rather than fails outright if none of the specific selectors hit.
 GLASSDOOR_BOOKMARKLET_JS = """(function(){
 var m = location.href.match(/[?&](?:jl|jobListingId)=(\\d+)/) || location.pathname.match(/-JV_[A-Za-z0-9]*?(\\d{6,})\\.htm/);
-if(!m){alert('JobHunter: could not find a job ID in this URL — open a specific Glassdoor job listing first');return;}
+if(!m){alert('Job Search Assistant: could not find a job ID in this URL — open a specific Glassdoor job listing first');return;}
 var id = 'glassdoor_' + m[1];
 var g = function(sel){ var e = document.querySelector(sel); return e ? e.textContent.trim() : ''; };
 var title = g('[data-test="job-title"]') || g('.JobDetails_jobTitle__') || g('h1');
@@ -515,7 +515,7 @@ var sels = ['[data-test="jobDescriptionContent"]', '.JobDetails_jobDescription__
 var el = null;
 for (var i=0;i<sels.length;i++){ el = document.querySelector(sels[i]); if (el && el.innerText && el.innerText.length > 200) break; else el = null; }
 var text = (el ? el.innerText : document.body.innerText).slice(0, 12000);
-if(!confirm('JobHunter: add this Glassdoor job (' + text.length + ' characters)?\\n\\n' + (title||'(title not found)') + ' — ' + (company||'(company not found)') + '\\n\\n' + text.slice(0,300) + '...')) return;
+if(!confirm('Job Search Assistant: add this Glassdoor job (' + text.length + ' characters)?\\n\\n' + (title||'(title not found)') + ' — ' + (company||'(company not found)') + '\\n\\n' + text.slice(0,300) + '...')) return;
 var receiver = 'http://127.0.0.1:__DASHBOARD_PORT__/add-glassdoor-bookmarklet#' + encodeURIComponent(JSON.stringify({job_id:m[1], title:title, company:company, location:'', url:location.href, raw_description:text}));
 var popup = window.open(receiver, 'jobhunter-add-glassdoor', 'popup,width=480,height=380');
 if(!popup) location.href = receiver;
@@ -525,9 +525,9 @@ GLASSDOOR_BOOKMARKLET_HREF = "javascript:" + quote(GLASSDOOR_BOOKMARKLET_JS.repl
 
 GLASSDOOR_RECEIVER_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JobHunter add from Glassdoor</title>
+<title>Job Search Assistant add from Glassdoor</title>
 <style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5;color:#0f172a}#status{padding:1rem;border-radius:.75rem;background:#f1f5f9}.error{background:#fef2f2!important;color:#991b1b}.success{background:#ecfdf5!important;color:#047857}</style>
-</head><body><h1>JobHunter</h1><p id="status">Adding the Glassdoor job and scoring it…</p>
+</head><body><h1>Job Search Assistant</h1><p id="status">Adding the Glassdoor job and scoring it…</p>
 <script>
 (async function () {
   var status = document.getElementById('status');
@@ -541,7 +541,7 @@ GLASSDOOR_RECEIVER_HTML = """<!doctype html>
     var response = await fetch('/add-glassdoor', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     var data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Unknown error');
-    status.textContent = data.duplicate ? 'Already tracked.' : ('Added — ' + data.overall_score + '/100 (' + data.recommendation + '). You can close this window and refresh JobHunter.');
+    status.textContent = data.duplicate ? 'Already tracked.' : ('Added — ' + data.overall_score + '/100 (' + data.recommendation + '). You can close this window and refresh Job Search Assistant.');
     status.className = 'success';
   } catch (error) {
     status.textContent = 'Adding failed: ' + error.message;
@@ -573,7 +573,7 @@ def home() -> str:
         stat_tile("Discarded", counts.get("DISCARDED", 0)),
         stat_tile("Declined", counts.get("DECLINED", 0)),
     ])
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>JobHunter — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">JobHunter v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><div id="rescore-queue-badge" hidden class="mb-4 inline-flex items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">Job Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
 async function act(job_id, action) {{
   const r = await fetch('/action', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{job_id, action}})}});
   if (!r.ok) return alert('Could not update job');
@@ -599,9 +599,9 @@ async function pollRescoreQueue() {{
     const inFlightIds = new Set(data.jobs.map(j => j.job_id));
 
     if (!data.jobs.length) {{
-      badge.hidden = true;
+      badge.classList.add('hidden'); badge.classList.remove('inline-flex');
     }} else {{
-      badge.hidden = false;
+      badge.classList.remove('hidden'); badge.classList.add('inline-flex');
       text.textContent = data.jobs.length === 1
         ? 'Rescoring "' + data.jobs[0].title + '" — ' + data.jobs[0].status
         : 'Rescoring ' + data.jobs.length + ' jobs — ' + data.jobs.map(j => j.title).join(', ');
@@ -908,7 +908,7 @@ def search_terms_report() -> str:
             '<th class="py-2 pr-4 text-right">Kept</th><th class="py-2 text-right">Discard rate</th>'
             '</tr></thead><tbody>' + "".join(row_parts) + '</tbody></table></div>'
         )
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>JobHunter — search term performance</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-3xl p-4 sm:p-8">
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — search term performance</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-3xl p-4 sm:p-8">
 <a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
 <h1 class="mt-2 text-2xl font-bold tracking-tight">Search term performance</h1>
 <p class="mt-2 text-slate-600">How each active-search term ({html.escape(PROFILE.capitalize())}'s LinkedIn/Indeed/Glassdoor searches) is doing, based on your own Keep/Discard/Applied/Declined decisions on the jobs it found. A high discard rate means that term is mostly surfacing noise — worth narrowing or removing from <code>preferences.json</code>. Only terms with at least 3 decided jobs are shown.</p>

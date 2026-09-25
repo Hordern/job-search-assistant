@@ -1,5 +1,5 @@
 """Resolves the per-user profile directory (users/<profile>/) shared by every
-JobHunter module (db.py, scorer.py, ingest.py, app.py). Each profile has its
+Job Search Assistant module (db.py, scorer.py, ingest.py, app.py). Each profile has its
 own .env, cv_scoring_full.txt, preferences.json and jobs.db, so one codebase
 can run multiple independent people's job searches — set JOBSEARCH_PROFILE to
 pick which one a given process uses.

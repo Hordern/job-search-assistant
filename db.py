@@ -1,4 +1,4 @@
-"""SQLite persistence for JobHunter."""
+"""SQLite persistence for Job Search Assistant."""
 
 import json
 import sqlite3
