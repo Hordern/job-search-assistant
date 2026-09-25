@@ -21,7 +21,10 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from commute import get_commute
-from db import connection, get_job_id, init_db, latest_ingestion_run, run_events, save_job, toggle_favorite
+from db import (
+    connection, get_job_id, init_db, latest_ingestion_run, run_events, save_job, search_term_stats,
+    toggle_favorite,
+)
 from ingest import fetch_seek_description, fingerprint
 from profile import PROFILE, PROFILE_DIR
 import scorer
@@ -101,6 +104,17 @@ SECTION_ACTIONS: dict[str, list[tuple[str, str, str]]] = {
         ("DECLINED", "Decline", "rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-600"),
     ],
 }
+
+
+def _source_badge(source: str | None) -> str:
+    """No badge for source=None — jobs saved before this column existed,
+    left unlabelled rather than guessed (SEEK is always email, but
+    LinkedIn/Indeed/Glassdoor rows could be either)."""
+    if source == "search":
+        return '<span class="rounded-full bg-teal-100 px-2 py-0.5 text-teal-700">🔍 Found by search</span>'
+    if source == "email":
+        return '<span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">📧 Inbox alert</span>'
+    return ""
 
 
 def _age_badge(date_posted: str | None) -> str:
@@ -223,6 +237,7 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     {fit_tag('Location', location_fit, fit_cls(location_fit))}
     {_distance_badge(evaluation)}
     {_age_badge(row['date_posted'])}
+    {_source_badge(row['source'])}
     {_eligibility_badges(evaluation)}
   </div>
   <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -249,7 +264,7 @@ def _unscored_card(row: sqlite3.Row, buttons_html: str) -> str:
 </article>'''
 
 
-_CARD_FIELDS = "id, title, company, platform, url, raw_description, ai_evaluation, overall_score, created_at, status, date_posted, favorited"
+_CARD_FIELDS = "id, title, company, platform, url, raw_description, ai_evaluation, overall_score, created_at, status, date_posted, favorited, source"
 
 # capability_score is now uncapped (see scorer.py) — a great skills match on
 # a job you're genuinely ineligible for can score higher than a merely-okay
@@ -558,7 +573,7 @@ def home() -> str:
         stat_tile("Discarded", counts.get("DISCARDED", 0)),
         stat_tile("Declined", counts.get("DECLINED", 0)),
     ])
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>JobHunter — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">JobHunter v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button></header><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>JobHunter — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">JobHunter v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
 async function act(job_id, action) {{
   const r = await fetch('/action', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{job_id, action}})}});
   if (!r.ok) return alert('Could not update job');
@@ -797,6 +812,50 @@ def export_applied_csv() -> Response:
         content=buffer.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=jobhunter_applied.csv"},
     )
+
+
+@app.get("/search-terms", response_class=HTMLResponse)
+def search_terms_report() -> str:
+    """How each configured active-search term is performing — found vs.
+    kept vs. discarded, so a noisy term (high discard rate) is easy to
+    spot and prune from preferences.json. Read-only: this never edits
+    connectors itself, it just surfaces the evidence for a human call."""
+    stats = search_term_stats()
+    if not stats:
+        rows_html = '<p class="rounded-xl bg-white p-5 text-slate-500 shadow">No search-term data yet — needs at least 3 kept/discarded decisions on a term\'s jobs before it shows up here.</p>'
+    else:
+        row_parts = []
+        for s in stats:
+            rate_pct = round(s["discard_rate"] * 100)
+            rate_cls = (
+                "bg-red-100 text-red-700" if rate_pct >= 80
+                else "bg-amber-100 text-amber-700" if rate_pct >= 50
+                else "bg-emerald-100 text-emerald-700"
+            )
+            row_parts.append(
+                f'<tr class="border-b border-slate-100">'
+                f'<td class="py-2 pr-4 font-medium">{html.escape(s["search_term"])}</td>'
+                f'<td class="py-2 pr-4 text-slate-500">{html.escape(s["platform"])}</td>'
+                f'<td class="py-2 pr-4 text-right">{s["found"]}</td>'
+                f'<td class="py-2 pr-4 text-right">{s["decided"]}</td>'
+                f'<td class="py-2 pr-4 text-right">{s["kept"]}</td>'
+                f'<td class="py-2 text-right"><span class="rounded-full {rate_cls} px-2 py-0.5 text-xs font-semibold">{rate_pct}% discarded</span></td>'
+                f'</tr>'
+            )
+        rows_html = (
+            '<div class="overflow-x-auto rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">'
+            '<table class="w-full text-sm"><thead><tr class="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500">'
+            '<th class="py-2 pr-4">Search term</th><th class="py-2 pr-4">Platform</th>'
+            '<th class="py-2 pr-4 text-right">Found</th><th class="py-2 pr-4 text-right">Decided</th>'
+            '<th class="py-2 pr-4 text-right">Kept</th><th class="py-2 text-right">Discard rate</th>'
+            '</tr></thead><tbody>' + "".join(row_parts) + '</tbody></table></div>'
+        )
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>JobHunter — search term performance</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-3xl p-4 sm:p-8">
+<a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
+<h1 class="mt-2 text-2xl font-bold tracking-tight">Search term performance</h1>
+<p class="mt-2 text-slate-600">How each active-search term ({html.escape(PROFILE.capitalize())}'s LinkedIn/Indeed/Glassdoor searches) is doing, based on your own Keep/Discard/Applied/Declined decisions on the jobs it found. A high discard rate means that term is mostly surfacing noise — worth narrowing or removing from <code>preferences.json</code>. Only terms with at least 3 decided jobs are shown.</p>
+<div class="mt-6">{rows_html}</div>
+</main></body></html>'''
 
 
 @app.get("/add-seek-bookmarklet", response_class=HTMLResponse)

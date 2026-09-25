@@ -120,6 +120,7 @@ def search_ingest_connector(platform: str, config: dict[str, Any], results_wante
                 "title": title, "company": company, "location": loc_text, "url": url,
                 "raw_description": description, "ai_evaluation": None, "overall_score": None,
                 "date_posted": str(date_posted) if date_posted is not None and str(date_posted) != "NaT" else None,
+                "source": "search", "search_term": term,
             }
 
             if len(description) >= _MIN_DESCRIPTION_LENGTH:

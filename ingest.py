@@ -211,6 +211,7 @@ def _extract_jobs(html: str) -> list[dict[str, str]]:
             "location": location_from_card[:120],
             "url": url,
             "raw_description": " | ".join(strings),
+            "source": "email",
         }
         richness[canonical_id] = card_score
     return list(found.values())

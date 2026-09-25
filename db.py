@@ -102,6 +102,17 @@ def init_db() -> None:
             # Favourite/star flag — independent of status (a NEW or
             # TO_PROCESS job can be starred without changing its workflow state).
             "ALTER TABLE jobs ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0",
+            # How this job entered the system: 'email' (inbox job-alert,
+            # ingest.py) or 'search' (active JobSpy keyword search,
+            # search_ingest.py). NULL for rows saved before this column
+            # existed — deliberately left unset rather than guessed, since
+            # LinkedIn/Indeed/Glassdoor jobs could have come from either path.
+            "ALTER TABLE jobs ADD COLUMN source TEXT",
+            # Which configured search_term (search_ingest.py only) found this
+            # job — lets us measure a term's keep/discard rate over time and
+            # spot ones that are only surfacing noise. NULL for email-sourced
+            # jobs and any search jobs saved before this column existed.
+            "ALTER TABLE jobs ADD COLUMN search_term TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -149,8 +160,9 @@ def save_job(job_dict: dict[str, Any]) -> int | None:
             """
             INSERT OR IGNORE INTO jobs (
                 canonical_id, fingerprint, platform, title, company, location,
-                url, raw_description, ai_evaluation, overall_score, status, created_at, date_posted
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                url, raw_description, ai_evaluation, overall_score, status, created_at, date_posted,
+                source, search_term
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_dict["canonical_id"], job_dict["fingerprint"], job_dict["platform"],
@@ -160,9 +172,55 @@ def save_job(job_dict: dict[str, Any]) -> int | None:
                 job_dict.get("overall_score"), job_dict.get("status", "NEW"),
                 job_dict.get("created_at", datetime.now(timezone.utc).isoformat()),
                 job_dict.get("date_posted"),
+                job_dict.get("source"), job_dict.get("search_term"),
             ),
         )
         return cursor.lastrowid if cursor.rowcount == 1 else None
+
+
+_KEPT_STATUSES = ("TO_PROCESS", "APPLIED")
+_DECIDED_STATUSES = ("TO_PROCESS", "APPLIED", "DISCARDED", "DECLINED")
+
+
+def search_term_stats() -> list[dict[str, Any]]:
+    """Per (platform, search_term) performance for active-search-sourced
+    jobs — how many it's found, how many are still undecided, and of the
+    ones actually decided, what fraction were kept vs discarded/declined.
+    Ordered worst-discard-rate first so a noisy term is easy to spot.
+    Terms with fewer than 3 decided jobs are excluded — too little signal
+    to judge yet, not because they're bad."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT platform, search_term, status, COUNT(*) AS n
+            FROM jobs
+            WHERE source = 'search' AND search_term IS NOT NULL
+            GROUP BY platform, search_term, status
+            """
+        ).fetchall()
+
+    stats: dict[tuple[str, str], dict[str, int]] = {}
+    for row in rows:
+        key = (row["platform"], row["search_term"])
+        stats.setdefault(key, {"found": 0, "kept": 0, "decided": 0})
+        stats[key]["found"] += row["n"]
+        if row["status"] in _DECIDED_STATUSES:
+            stats[key]["decided"] += row["n"]
+        if row["status"] in _KEPT_STATUSES:
+            stats[key]["kept"] += row["n"]
+
+    result = []
+    for (platform, term), s in stats.items():
+        if s["decided"] < 3:
+            continue
+        discard_rate = 1 - (s["kept"] / s["decided"])
+        result.append({
+            "platform": platform, "search_term": term,
+            "found": s["found"], "decided": s["decided"], "kept": s["kept"],
+            "discard_rate": round(discard_rate, 2),
+        })
+    result.sort(key=lambda r: r["discard_rate"], reverse=True)
+    return result
 
 
 def toggle_favorite(job_id: int) -> bool | None:
