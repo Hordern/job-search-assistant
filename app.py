@@ -223,7 +223,7 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     # LinkedIn stub scored via the bookmarklet's one-off text never gets one
     # saved, so re-running here would just 400.
     rescore_button = (
-        f'''<button onclick="rescoreJob({row['id']}, this)" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" title="Re-run scoring with the latest CV, preferences and stored job description">Rescore</button>'''
+        f'''<button onclick="rescoreJob({row['id']}, this)" data-rescore-btn="{row['id']}" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" title="Re-run scoring with the latest CV, preferences and stored job description">Rescore</button>'''
         if row["raw_description"] else ""
     )
     return f'''<article data-scored="1" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
@@ -579,6 +579,16 @@ async function act(job_id, action) {{
   if (!r.ok) return alert('Could not update job');
   location.reload();
 }}
+// Single source of truth for every rescore in flight for this profile —
+// polled regardless of which tab/click started it, so reopening the page
+// (or never having clicked anything here at all) still shows accurate
+// per-button state and a page-wide badge. A rescore this specific click
+// started stays in _locallyHandled until its own fetch resolves, so this
+// poller's completion-triggered reload doesn't collide with that call's
+// own success/failure handling.
+const _locallyHandled = new Set();
+let _lastInFlightIds = new Set();
+
 async function pollRescoreQueue() {{
   try {{
     const r = await fetch('/reprocess-queue');
@@ -586,34 +596,47 @@ async function pollRescoreQueue() {{
     const data = await r.json();
     const badge = document.getElementById('rescore-queue-badge');
     const text = document.getElementById('rescore-queue-text');
-    if (!data.jobs.length) {{ badge.hidden = true; return; }}
-    badge.hidden = false;
-    if (data.jobs.length === 1) {{
-      text.textContent = 'Rescoring "' + data.jobs[0].title + '" — ' + data.jobs[0].status;
+    const inFlightIds = new Set(data.jobs.map(j => j.job_id));
+
+    if (!data.jobs.length) {{
+      badge.hidden = true;
     }} else {{
-      text.textContent = 'Rescoring ' + data.jobs.length + ' jobs — ' + data.jobs.map(j => j.title).join(', ');
+      badge.hidden = false;
+      text.textContent = data.jobs.length === 1
+        ? 'Rescoring "' + data.jobs[0].title + '" — ' + data.jobs[0].status
+        : 'Rescoring ' + data.jobs.length + ' jobs — ' + data.jobs.map(j => j.title).join(', ');
     }}
+
+    document.querySelectorAll('[data-rescore-btn]').forEach(btn => {{
+      const id = parseInt(btn.getAttribute('data-rescore-btn'), 10);
+      const job = data.jobs.find(j => j.job_id === id);
+      if (job) {{
+        btn.disabled = true;
+        btn.textContent = job.status;
+      }} else if (btn.disabled && !_locallyHandled.has(id)) {{
+        // Was in flight, isn't any more, and no local click is already
+        // handling its own result — it finished elsewhere/earlier while
+        // this page had it open. Reload once to pick up the new score.
+        location.reload();
+      }}
+    }});
+
+    _lastInFlightIds = inFlightIds;
   }} catch (e) {{ /* best-effort — next poll will pick it back up */ }}
 }}
 setInterval(pollRescoreQueue, 1000);
 pollRescoreQueue();
+
 async function rescoreJob(job_id, btn) {{
   const original = btn.textContent;
+  _locallyHandled.add(job_id);
   btn.disabled = true;
   btn.textContent = 'Waiting…';
-  const poll = setInterval(async () => {{
-    try {{
-      const s = await fetch('/reprocess-status/' + job_id);
-      if (!s.ok) return;
-      const data = await s.json();
-      if (data.status) btn.textContent = data.status;
-    }} catch (e) {{ /* polling is best-effort — a miss just leaves the last label showing */ }}
-  }}, 400);
   let r;
   try {{
     r = await fetch('/reprocess/' + job_id, {{method:'POST'}});
   }} finally {{
-    clearInterval(poll);
+    _locallyHandled.delete(job_id);
   }}
   if (!r.ok) {{
     const body = await r.json().catch(() => ({{}}));
