@@ -15,6 +15,8 @@ import anthropic
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from jobspy.linkedin import LinkedIn as _LinkedInScraper
+from jobspy.model import DescriptionFormat, ScraperInput, Site
 
 from db import (
     emails_ready_to_move, finish_ingestion_run, get_job_id, is_email_processed,
@@ -93,6 +95,34 @@ def fetch_seek_description(url: str) -> dict[str, str | None] | None:
         return None
     posted_match = _SEEK_POSTED_RE.search(soup.get_text(" ", strip=True))
     return {"description": text[:12000], "date_posted": posted_match.group(0) if posted_match else None}
+
+
+# LinkedIn alert emails only ever carry title/company/location — the actual
+# duties/requirements text isn't in the email at all (unlike SEEK), and a
+# direct fetch of the normal job page hits LinkedIn's login wall. JobSpy's
+# per-job fetch (used by search_ingest.py) works without login, verified
+# live (2026-09-24) against a real job ID — reusing that exact mechanism
+# here closes the gap that otherwise leaves every LinkedIn alert unscored.
+# _get_job_details is a private (underscored) JobSpy method, not a
+# published API — verified working, but could break on a library update.
+_linkedin_scraper = _LinkedInScraper()
+_linkedin_scraper.scraper_input = ScraperInput(
+    site_type=[Site.LINKEDIN], search_term="", description_format=DescriptionFormat.MARKDOWN,
+)
+
+
+def fetch_linkedin_description(job_id: str) -> dict[str, str | None] | None:
+    """Returns {"description": str, "date_posted": None} or None on failure.
+    date_posted is always None here — JobSpy's per-job fetch (unlike its
+    search results) doesn't return a posting date, only scrape() does."""
+    try:
+        details = _linkedin_scraper._get_job_details(job_id)
+    except Exception:
+        return None
+    description = details.get("description")
+    if not description:
+        return None
+    return {"description": description[:12000], "date_posted": None}
 
 
 def _html_from_message(message: Message) -> str:
@@ -309,6 +339,12 @@ def ingest_alerts() -> dict[str, int]:
                                 full_description = seek_result["description"]
                                 job["raw_description"] = full_description
                                 job["date_posted"] = seek_result["date_posted"]
+                        elif job["platform"] == "linkedin":
+                            linkedin_id = job["canonical_id"].split("_", 1)[1]
+                            linkedin_result = fetch_linkedin_description(linkedin_id)
+                            if linkedin_result:
+                                full_description = linkedin_result["description"]
+                                job["raw_description"] = full_description
 
                         if not full_description:
                             # No real description available — scoring on title/company

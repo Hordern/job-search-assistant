@@ -275,6 +275,11 @@ def extract_job_requirements(text: str, title: str, company: str, description: s
         raise ValueError(f"Invalid work_arrangement: {result.get('work_arrangement')!r}")
     if result.get("travel") not in VALID_TRAVEL:
         raise ValueError(f"Invalid travel: {result.get('travel')!r}")
+    # Not quote-validated (it's a paraphrase, not sourced text) and not
+    # required — cosmetic UI copy shouldn't trigger a parse-retry on the
+    # already-flaky JSON output if a provider ever omits it.
+    if not isinstance(result.get("summary"), str):
+        result["summary"] = ""
     result["_fuzzy_quotes"] = fuzzy_quotes
     return result
 
@@ -746,7 +751,10 @@ class ParseFailure(RuntimeError):
         self.raw_text = raw_text
 
 
-def _call_and_parse(call: Callable[[str], str], prompt: str, parse_fn: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
+def _call_and_parse(
+    call: Callable[[str], str], prompt: str, parse_fn: Callable[[str], dict[str, Any]],
+    on_step: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     """Bounded retries on a parse/schema failure. Catches ValueError
     (includes json.JSONDecodeError, a ValueError subclass, and every
     explicit schema-invalid raise in the extract_*() functions) plus
@@ -758,7 +766,9 @@ def _call_and_parse(call: Callable[[str], str], prompt: str, parse_fn: Callable[
     last_exc: Exception | None = None
     last_raw: str | None = None
     current_prompt = prompt
-    for _ in range(_MAX_PARSE_ATTEMPTS):
+    for attempt in range(_MAX_PARSE_ATTEMPTS):
+        if attempt > 0 and on_step:
+            on_step(f"Retrying (attempt {attempt + 1} of {_MAX_PARSE_ATTEMPTS})…")
         raw = call(current_prompt)
         last_raw = raw
         try:
@@ -888,7 +898,10 @@ def _renumber_requirements(requirements: list[dict[str, Any]]) -> list[dict[str,
     return requirements
 
 
-def run_pipeline(call: Callable[[str], str], title: str, company: str, description: str, force_audit: bool = False) -> dict[str, Any]:
+def run_pipeline(
+    call: Callable[[str], str], title: str, company: str, description: str, force_audit: bool = False,
+    on_step: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     """Runs the full job-extraction → conditional-audit → CV-matching →
     deterministic-scoring pipeline against any provider. `call` is a plain
     function of (prompt: str) -> str — the only thing that differs between
@@ -900,10 +913,17 @@ def run_pipeline(call: Callable[[str], str], title: str, company: str, descripti
     force_audit=True always runs the audit pass regardless of needs_audit()
     — intended for benchmark/comparison runs where extraction completeness
     itself is under test, not for production (where the conditional
-    heuristic keeps cost down)."""
+    heuristic keeps cost down).
+
+    on_step, if given, is called with a short human-readable label at each
+    stage transition — purely cosmetic (e.g. a UI polling a manual-rescore
+    button's progress), never affects scoring."""
+    if on_step:
+        on_step("Reading the job ad…")
     job_extraction = _call_and_parse(
         call, build_job_extraction_prompt(title, company, description),
         lambda text: extract_job_requirements(text, title, company, description),
+        on_step,
     )
     calls_made = 1
     pre_audit_count = len(job_extraction.get("requirements") or [])
@@ -911,9 +931,12 @@ def run_pipeline(call: Callable[[str], str], title: str, company: str, descripti
     audit_fuzzy_quotes: list[str] = []
 
     if force_audit or needs_audit(job_extraction, description):
+        if on_step:
+            on_step("Double-checking for missed requirements…")
         audit = _call_and_parse(
             call, build_audit_prompt(title, company, description, job_extraction),
             lambda text: extract_audit_findings(text, title, company, description),
+            on_step,
         )
         audit_added_count = len(audit["missing_requirements"])
         audit_fuzzy_quotes = audit.get("_fuzzy_quotes", [])
@@ -938,13 +961,18 @@ def run_pipeline(call: Callable[[str], str], title: str, company: str, descripti
         "extraction_fuzzy_quotes": fuzzy_quotes,
     }
 
+    if on_step:
+        on_step("Matching against your CV…")
     cv_matching = _call_and_parse(
         call, build_cv_matching_prompt(job_extraction),
         lambda text: extract_cv_matches(text, expected_ids),
+        on_step,
     )
     calls_made += 1
     job_extraction["extraction_stats"]["cv_evidence_fuzzy_quotes"] = cv_matching.pop("_fuzzy_evidence", [])
 
+    if on_step:
+        on_step("Calculating score…")
     result = compute_final_result(job_extraction, cv_matching)
     result["calls_made"] = calls_made
     result["job_extraction"] = job_extraction
@@ -957,7 +985,9 @@ def _anthropic_call(client: Anthropic, prompt: str, max_tokens: int = 8192) -> s
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def score_job(title: str, company: str, description: str) -> dict[str, Any]:
+def score_job(
+    title: str, company: str, description: str, on_step: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     """Score one alert preview via Claude — the production entrypoint used
     by app.py/ingest.py. Return shape is unchanged from earlier designs
     (cv_fit_score, salary_fit, location_fit, overall_score, recommendation,
@@ -966,4 +996,4 @@ def score_job(title: str, company: str, description: str) -> dict[str, Any]:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
     client = Anthropic()
-    return run_pipeline(lambda prompt: _anthropic_call(client, prompt), title, company, description)
+    return run_pipeline(lambda prompt: _anthropic_call(client, prompt), title, company, description, on_step=on_step)

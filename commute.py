@@ -30,6 +30,12 @@ _MIN_REQUEST_INTERVAL_S = 1.1
 
 _cache: dict[str, Any] | None = None
 _last_request_time = 0.0
+# A failed lookup (network error, or the geocoder rate-limiting us) is cached
+# for this long before we retry it — without this, every uncached location on
+# every page load re-attempts and re-fails the same request, which is both
+# slow (each failure still costs a real network round-trip) and makes the
+# rate-limiting worse, not better.
+_FAILURE_RETRY_AFTER_S = 3600
 
 
 def _load_cache() -> dict[str, Any]:
@@ -55,7 +61,13 @@ def _geocode(place: str) -> tuple[float, float] | None:
     cache = _load_cache()
     key = f"geocode:{place.strip().lower()}"
     if key in cache:
-        return tuple(cache[key]) if cache[key] else None
+        cached = cache[key]
+        if isinstance(cached, dict) and cached.get("_failed_at") is not None:
+            if time.time() - cached["_failed_at"] < _FAILURE_RETRY_AFTER_S:
+                return None
+            # retry-after window elapsed — fall through and re-attempt
+        else:
+            return tuple(cached) if cached else None
 
     elapsed = time.monotonic() - _last_request_time
     if elapsed < _MIN_REQUEST_INTERVAL_S:
@@ -77,6 +89,9 @@ def _geocode(place: str) -> tuple[float, float] | None:
             return None
         coords = (float(results[0]["lat"]), float(results[0]["lon"]))
     except (requests.RequestException, KeyError, IndexError, ValueError):
+        _last_request_time = time.monotonic()
+        cache[key] = {"_failed_at": time.time()}
+        _save_cache()
         return None
 
     cache[key] = list(coords)

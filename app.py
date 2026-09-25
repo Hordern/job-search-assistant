@@ -24,6 +24,7 @@ from commute import get_commute
 from db import connection, get_job_id, init_db, latest_ingestion_run, run_events, save_job, toggle_favorite
 from ingest import fetch_seek_description, fingerprint
 from profile import PROFILE, PROFILE_DIR
+import scorer
 from scorer import load_prefs, score_job
 from version import build_version
 
@@ -156,8 +157,38 @@ def _distance_badge(evaluation: dict) -> str:
     return f'<span class="rounded-full bg-sky-100 px-2 py-0.5 text-sky-700">~{commute["distance_km"]} km (straight-line)</span>'
 
 
+_IMPORTANCE_RANK = {"mandatory": 3, "core": 2, "preferred": 1}
+_MATCH_STATE_RANK = {"direct": 2, "adjacent": 1}
+
+
+def _positives(evaluation: dict) -> list[str]:
+    """Requirements the CV has real evidence for (direct/adjacent match),
+    ranked by how important the requirement is and how strong the evidence
+    is — the counterpart to `gaps`, so a card doesn't read as pure deficit."""
+    req_by_id = {
+        r["requirement_id"]: r for r in (evaluation.get("job_extraction") or {}).get("requirements") or []
+    }
+    ranked = []
+    for m in (evaluation.get("cv_matching") or {}).get("matches") or []:
+        state = m.get("match_state")
+        if state not in _MATCH_STATE_RANK:
+            continue
+        req = req_by_id.get(m.get("requirement_id"))
+        text = req.get("requirement") if req else None
+        if not text:
+            continue
+        rank = (_IMPORTANCE_RANK.get(req.get("importance"), 0), _MATCH_STATE_RANK[state])
+        ranked.append((rank, text))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [text for _, text in ranked[:5]]
+
+
 def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     evaluation = json.loads(row["ai_evaluation"])
+    summary = str((evaluation.get("job_extraction") or {}).get("summary") or "").strip()
+    summary_html = f'<p class="mt-2 text-sm text-slate-600">{html.escape(summary)}</p>' if summary else ""
+    positives = _positives(evaluation)
+    positives_html = "".join(f"<li>{html.escape(p)}</li>" for p in positives) or "<li>No confirmed matches yet.</li>"
     gaps = evaluation.get("gaps") or []
     gap_html = "".join(f"<li>{html.escape(str(gap))}</li>" for gap in gaps) or "<li>No gaps listed.</li>"
     fit_tag = lambda label, value, cls: (
@@ -174,9 +205,17 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     status_label = str(row["status"]).replace("_", " ").title()
     is_favorited = bool(row["favorited"])
     star_button = f'''<button onclick="toggleFavorite({row['id']}, this)" data-favorited="{"1" if is_favorited else "0"}" class="shrink-0 text-xl leading-none {"text-rose-500" if is_favorited else "text-slate-300 hover:text-slate-400"}" title="{"Remove from favourites" if is_favorited else "Add to favourites"}">{"♥" if is_favorited else "♡"}</button>'''
+    # Only offered when we have a stored description to rescore from — a
+    # LinkedIn stub scored via the bookmarklet's one-off text never gets one
+    # saved, so re-running here would just 400.
+    rescore_button = (
+        f'''<button onclick="rescoreJob({row['id']}, this)" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" title="Re-run scoring with the latest CV, preferences and stored job description">Rescore</button>'''
+        if row["raw_description"] else ""
+    )
     return f'''<article data-scored="1" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
   <div class="flex items-start justify-between gap-4"><div><h2 class="text-lg font-bold">{html.escape(row['title'] or '')}</h2><p class="text-slate-600">{html.escape(row['company'] or '')}</p></div><div class="flex items-center gap-2">{star_button}<span class="rounded-full bg-indigo-100 px-3 py-1 text-sm font-bold text-indigo-700">Score {row['overall_score'] or 0}</span></div></div>
   <p class="mt-2 text-xs font-semibold uppercase tracking-wide text-indigo-700">{html.escape(str(evaluation.get('recommendation') or 'Unrated'))} · {html.escape(str(row['platform'] or ''))} · {html.escape(status_label)}</p>
+  {summary_html}
   <p class="mt-4 text-sm"><span class="font-semibold">Pitch angle:</span> {html.escape(str(evaluation.get('pitch_angle') or 'Not available'))}</p>
   <div class="mt-3 flex flex-wrap gap-2 text-xs">
     <span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">CV fit: {evaluation.get('cv_fit_score', '—')}</span>
@@ -186,8 +225,11 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     {_age_badge(row['date_posted'])}
     {_eligibility_badges(evaluation)}
   </div>
-  <p class="mt-3 text-sm font-semibold">Gaps</p><ul class="ml-5 list-disc text-sm text-slate-600">{gap_html}</ul>
-  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer">View</a>{buttons_html}</div>
+  <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+    <div><p class="text-sm font-semibold text-emerald-700">Strengths</p><ul class="ml-5 list-disc text-sm text-slate-600">{positives_html}</ul></div>
+    <div><p class="text-sm font-semibold text-slate-700">Gaps</p><ul class="ml-5 list-disc text-sm text-slate-600">{gap_html}</ul></div>
+  </div>
+  <div class="mt-5 flex flex-wrap gap-2"><a class="rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white" href="{html.escape(row['url'] or '', quote=True)}" target="_blank" rel="noopener noreferrer">View</a>{buttons_html}{rescore_button}</div>
 </article>'''
 
 
@@ -207,7 +249,7 @@ def _unscored_card(row: sqlite3.Row, buttons_html: str) -> str:
 </article>'''
 
 
-_CARD_FIELDS = "id, title, company, platform, url, ai_evaluation, overall_score, created_at, status, date_posted, favorited"
+_CARD_FIELDS = "id, title, company, platform, url, raw_description, ai_evaluation, overall_score, created_at, status, date_posted, favorited"
 
 # capability_score is now uncapped (see scorer.py) — a great skills match on
 # a job you're genuinely ineligible for can score higher than a merely-okay
@@ -522,6 +564,32 @@ async function act(job_id, action) {{
   if (!r.ok) return alert('Could not update job');
   location.reload();
 }}
+async function rescoreJob(job_id, btn) {{
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Waiting…';
+  const poll = setInterval(async () => {{
+    try {{
+      const s = await fetch('/reprocess-status/' + job_id);
+      if (!s.ok) return;
+      const data = await s.json();
+      if (data.status) btn.textContent = data.status;
+    }} catch (e) {{ /* polling is best-effort — a miss just leaves the last label showing */ }}
+  }}, 400);
+  let r;
+  try {{
+    r = await fetch('/reprocess/' + job_id, {{method:'POST'}});
+  }} finally {{
+    clearInterval(poll);
+  }}
+  if (!r.ok) {{
+    const body = await r.json().catch(() => ({{}}));
+    alert(body.detail || 'Could not rescore job');
+    btn.disabled = false; btn.textContent = original;
+    return;
+  }}
+  location.reload();
+}}
 async function toggleFavorite(job_id, btn) {{
   const r = await fetch('/favorite', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{job_id}})}});
   if (!r.ok) return alert('Could not update favourite');
@@ -652,6 +720,57 @@ def rescore(payload: RescorePayload) -> dict:
             "UPDATE jobs SET ai_evaluation = ?, overall_score = ? WHERE canonical_id = ?",
             (json.dumps(evaluation), evaluation["overall_score"], payload.canonical_id),
         )
+    return {"ok": True, "overall_score": evaluation["overall_score"], "recommendation": evaluation["recommendation"]}
+
+
+# In-memory only (not persisted, not shared across profiles' separate
+# processes) — a job_id's current step label while a manual rescore is in
+# flight, polled by the button's UI. Cleared once the request finishes
+# (success or failure), whichever comes first.
+_reprocess_status: dict[int, str] = {}
+
+
+@app.get("/reprocess-status/{job_id}")
+def reprocess_status(job_id: int) -> dict:
+    return {"status": _reprocess_status.get(job_id)}
+
+
+@app.post("/reprocess/{job_id}")
+def reprocess(job_id: int) -> dict:
+    """Manually re-run scoring on a job from its already-stored description
+    — same production scoring path as a normal ingest, just triggered by
+    hand. Resets scorer's module-level caches first so it re-reads the CV,
+    preferences and prompt config from disk rather than using whatever this
+    long-running process happened to load at startup — code changes still
+    need a process restart, but data/prompt edits are picked up immediately."""
+    with connection() as conn:
+        row = conn.execute("SELECT title, company, raw_description FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not row["raw_description"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No stored description to rescore from — use the rescore bookmarklet for LinkedIn jobs without one",
+        )
+    scorer._cv_text = None
+    scorer._prefs = None
+    scorer._prompt_config = None
+    _reprocess_status[job_id] = "Starting…"
+    try:
+        evaluation = score_job(
+            row["title"], row["company"], row["raw_description"],
+            on_step=lambda label: _reprocess_status.__setitem__(job_id, label),
+        )
+        _reprocess_status[job_id] = "Saving…"
+        with connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET ai_evaluation = ?, overall_score = ? WHERE id = ?",
+                (json.dumps(evaluation), evaluation["overall_score"], job_id),
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Rescore failed: {exc}") from exc
+    finally:
+        _reprocess_status.pop(job_id, None)
     return {"ok": True, "overall_score": evaluation["overall_score"], "recommendation": evaluation["recommendation"]}
 
 
