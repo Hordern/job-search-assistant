@@ -331,22 +331,22 @@ def _cards(status: str, empty_message: str) -> str:
 
 
 def _cards_all(empty_message: str) -> str:
-    """New + To-process combined into one score-ranked list — everything still
-    active in the pipeline, i.e. not yet Applied and not archived (Discarded/
-    Declined, which are deliberately excluded here so they stay out of the way)."""
+    """The untriaged pipeline — NEW only. Clicking Keep or Discard on a job
+    here moves it out to "To process" or the archive respectively, same as
+    Today; neither status lingers here once actioned."""
     with connection() as conn:
-        rows = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE status IN ('NEW','TO_PROCESS')").fetchall()
+        rows = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE status = 'NEW'").fetchall()
     return _render_jobs(rows, empty_message)
 
 
 def _cards_today(empty_message: str) -> str:
-    """Same active set as _cards_all, filtered to jobs created today in
+    """Same untriaged set as _cards_all, filtered to jobs created today in
     Melbourne time — done in Python rather than SQL since created_at is
     stored as UTC ISO8601 and SQLite's date functions don't handle the
     Melbourne-local cutoff correctly on their own."""
     today = datetime.now(MELBOURNE).date()
     with connection() as conn:
-        rows = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE status IN ('NEW','TO_PROCESS')").fetchall()
+        rows = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE status = 'NEW'").fetchall()
     todays_rows = [r for r in rows if datetime.fromisoformat(r["created_at"]).astimezone(MELBOURNE).date() == today]
     return _render_jobs(todays_rows, empty_message)
 
