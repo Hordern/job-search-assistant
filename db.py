@@ -119,6 +119,16 @@ def init_db() -> None:
             # Keep/Discard/Applied/Favourite actions.
             "ALTER TABLE jobs ADD COLUMN click_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE jobs ADD COLUMN last_clicked_at TIMESTAMP",
+            # Who/what last set `status` — 'user' (via the real Keep/Discard/
+            # Mark Applied/Decline buttons, i.e. genuine judgment) vs
+            # 'bulk_cleanup' (a direct DB script, e.g. "discard everything
+            # under score N"). NULL for rows never touched this way, or
+            # touched before this column existed (unknown/mixed provenance
+            # — don't assume either way). Critical for trusting any future
+            # preference-learning analysis: a bulk score-based discard says
+            # nothing about whether the candidate would have rejected that
+            # specific job on its merits.
+            "ALTER TABLE jobs ADD COLUMN status_source TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -194,26 +204,44 @@ def search_term_stats() -> list[dict[str, Any]]:
     ones actually decided, what fraction were kept vs discarded/declined.
     Ordered worst-discard-rate first so a noisy term is easy to spot.
     Terms with fewer than 3 decided jobs are excluded — too little signal
-    to judge yet, not because they're bad."""
+    to judge yet, not because they're bad.
+
+    A decision on a job whose employer matched an excluded industry
+    (industry_fit.status == 'excluded') is left out of the discard-rate
+    math entirely — that discard was about the employer, not whether the
+    term/title was a good match, so counting it against the term would
+    blame the wrong thing. Still counted in `found` and reported
+    separately as `industry_excluded`, so the number isn't just silently
+    dropped."""
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT platform, search_term, status, COUNT(*) AS n
+            SELECT platform, search_term, status, ai_evaluation
             FROM jobs
             WHERE source = 'search' AND search_term IS NOT NULL
-            GROUP BY platform, search_term, status
             """
         ).fetchall()
 
     stats: dict[tuple[str, str], dict[str, int]] = {}
     for row in rows:
         key = (row["platform"], row["search_term"])
-        stats.setdefault(key, {"found": 0, "kept": 0, "decided": 0})
-        stats[key]["found"] += row["n"]
+        s = stats.setdefault(key, {"found": 0, "kept": 0, "decided": 0, "industry_excluded": 0})
+        s["found"] += 1
+
+        industry_excluded = False
+        if row["ai_evaluation"]:
+            try:
+                industry_excluded = (json.loads(row["ai_evaluation"]).get("industry_fit") or {}).get("status") == "excluded"
+            except json.JSONDecodeError:
+                pass
+
         if row["status"] in _DECIDED_STATUSES:
-            stats[key]["decided"] += row["n"]
-        if row["status"] in _KEPT_STATUSES:
-            stats[key]["kept"] += row["n"]
+            if industry_excluded:
+                s["industry_excluded"] += 1
+            else:
+                s["decided"] += 1
+                if row["status"] in _KEPT_STATUSES:
+                    s["kept"] += 1
 
     result = []
     for (platform, term), s in stats.items():
@@ -223,6 +251,7 @@ def search_term_stats() -> list[dict[str, Any]]:
         result.append({
             "platform": platform, "search_term": term,
             "found": s["found"], "decided": s["decided"], "kept": s["kept"],
+            "industry_excluded": s["industry_excluded"],
             "discard_rate": round(discard_rate, 2),
         })
     result.sort(key=lambda r: r["discard_rate"], reverse=True)

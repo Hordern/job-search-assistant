@@ -65,7 +65,7 @@ VALID_MATCH_STATE = {"direct", "adjacent", "learning", "not_evidenced", "contrad
 VALID_EVIDENCE_DEPTH = {"production", "lab", "study", "inferred", "none"}
 VALID_SCOPE_MATCH = {"aligned", "moderate_step_down", "severe_step_down", "moderate_step_up", "severe_step_up"}
 VALID_CONFIDENCE = {"high", "medium", "low"}
-VALID_RECOMMENDATIONS = {"Strong Apply", "Apply", "Stretch", "Pass", "Ineligible"}
+VALID_RECOMMENDATIONS = {"Strong Apply", "Apply", "Stretch", "Pass", "Ineligible", "Excluded"}
 
 VALID_ELIGIBILITY_TIMING = {"must_already_hold", "can_obtain_after_appointment"}
 VALID_ELIGIBILITY_RESULT = {"met", "obtainable", "action_required", "unmet", "unknown", "not_applicable"}
@@ -280,6 +280,11 @@ def extract_job_requirements(text: str, title: str, company: str, description: s
     # already-flaky JSON output if a provider ever omits it.
     if not isinstance(result.get("summary"), str):
         result["summary"] = ""
+    # Same reasoning as summary — cosmetic/analytical metadata, not scored,
+    # not source-quoted, so a provider omitting it shouldn't trigger a
+    # parse-retry.
+    if not isinstance(result.get("employer_industry"), str):
+        result["employer_industry"] = ""
     result["_fuzzy_quotes"] = fuzzy_quotes
     return result
 
@@ -623,6 +628,26 @@ def compute_eligibility(eligibility_requirements: list[dict], profile_eligibilit
     return results
 
 
+def compute_industry_fit(employer_industry: str | None, prefs: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Returns (status, matched_label) — status is 'excluded', 'downmarked',
+    or None. employer_industry is Claude's free-text short label (e.g.
+    "Banking", "Retail Banking"), not a fixed enum, so matching is a
+    case-insensitive substring check in either direction against the
+    configured list rather than exact equality, which would miss obvious
+    matches like "Banking" vs "Retail Banking"."""
+    if not employer_industry:
+        return None, None
+    industry_prefs = prefs.get("industry_preferences") or {}
+    text = employer_industry.lower()
+    for label in industry_prefs.get("exclude", []):
+        if label.lower() in text or text in label.lower():
+            return "excluded", label
+    for label in industry_prefs.get("downmark", []):
+        if label.lower() in text or text in label.lower():
+            return "downmarked", label
+    return None, None
+
+
 def compute_final_result(job_extraction: dict[str, Any], cv_matching: dict[str, Any]) -> dict[str, Any]:
     """Combine pass-1 and pass-3 output into the final result, computing
     every fit/eligibility dimension deterministically in Python.
@@ -656,6 +681,7 @@ def compute_final_result(job_extraction: dict[str, Any], cv_matching: dict[str, 
     location_fit = compute_location_fit(
         job_extraction.get("location_text"), job_extraction.get("work_arrangement"), job_extraction.get("onsite_days"), prefs
     )
+    industry_status, industry_label = compute_industry_fit(job_extraction.get("employer_industry"), prefs)
 
     capability_score, decision_flags = compute_capability_score(requirements, matches)
     decision_flags["scope_match"] = scope_match
@@ -696,6 +722,8 @@ def compute_final_result(job_extraction: dict[str, Any], cv_matching: dict[str, 
         info_flags.append(f"{scope_match} — role likely below your demonstrated level; a fit/retention question, not a capability gap")
     if salary_fit == "poor" or location_fit == "poor":
         demote("Stretch", "poor salary or location fit")
+    if industry_status == "downmarked":
+        demote("Stretch", f"down-ranked industry: {industry_label}")
     if action_required_eligibility:
         demote("Stretch", f"eligibility action required ({', '.join(action_required_eligibility)})")
     # Unknown (the ad simply didn't state it — the common case) is visible
@@ -710,11 +738,21 @@ def compute_final_result(job_extraction: dict[str, Any], cv_matching: dict[str, 
         recommendation = "Ineligible"
         demotion_reasons.append(f"unmet eligibility requirement ({unmet_eligibility[0]}) — job is not applicable regardless of skill fit")
 
+    # Industry exclusion overrides everything except eligibility — a strong
+    # personal preference ("I don't want to work in banking"), not a
+    # capability judgement, so it takes priority over tier demotions from
+    # scope/salary/location but doesn't claim you're literally unable to
+    # take the job the way unmet eligibility does.
+    if industry_status == "excluded" and recommendation != "Ineligible":
+        recommendation = "Excluded"
+        demotion_reasons.append(f"excluded industry: {industry_label} — job matches an employer type you've asked to exclude, regardless of role fit")
+
     return {
         "cv_fit_score": capability_score,
         "capability_score": capability_score,
         "salary_fit": salary_fit,
         "location_fit": location_fit,
+        "industry_fit": {"status": industry_status, "label": industry_label},
         "eligibility": eligibility,
         "overall_score": capability_score,
         "recommendation": recommendation,

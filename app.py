@@ -9,7 +9,7 @@ import subprocess
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -69,6 +69,11 @@ class FavoritePayload(BaseModel):
 class TermSuggestionApplyPayload(BaseModel):
     add_terms: list[str] = []
     remove_terms: list[str] = []
+
+
+class TermQuestionAnswerPayload(BaseModel):
+    question: str
+    answer: str
 
 
 class RescorePayload(BaseModel):
@@ -164,6 +169,16 @@ def _eligibility_badges(evaluation: dict) -> str:
     return "".join(badges)
 
 
+def _industry_badge(evaluation: dict) -> str:
+    industry_fit = evaluation.get("industry_fit") or {}
+    status, label = industry_fit.get("status"), industry_fit.get("label")
+    if status == "excluded":
+        return f'<span class="rounded-full bg-red-100 px-2 py-0.5 text-red-700">Excluded industry: {html.escape(label or "")}</span>'
+    if status == "downmarked":
+        return f'<span class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-700">Down-ranked industry: {html.escape(label or "")}</span>'
+    return ""
+
+
 def _distance_badge(evaluation: dict) -> str:
     location_text = (evaluation.get("job_extraction") or {}).get("location_text")
     if not location_text:
@@ -250,6 +265,7 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     {_distance_badge(evaluation)}
     {_age_badge(row['date_posted'])}
     {_source_badge(row['source'])}
+    {_industry_badge(evaluation)}
     {_eligibility_badges(evaluation)}
   </div>
   <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -284,7 +300,7 @@ _CARD_FIELDS = "id, title, company, platform, url, raw_description, ai_evaluatio
 # real options. Rank by recommendation tier first, score only breaks ties
 # within a tier. Unrecognised/missing recommendation (shouldn't happen, but
 # don't let it silently sort to the top OR bottom) gets a middling rank.
-_RECOMMENDATION_RANK = {"Strong Apply": 4, "Apply": 3, "Stretch": 2, "Pass": 1, "Ineligible": 0}
+_RECOMMENDATION_RANK = {"Strong Apply": 4, "Apply": 3, "Stretch": 2, "Pass": 1, "Ineligible": 0, "Excluded": 0}
 
 
 def _sort_key(row: sqlite3.Row) -> tuple:
@@ -413,6 +429,7 @@ def _search_status() -> tuple[str, str, bool]:
 
 
 TERM_SUGGESTIONS_PATH = PROFILE_DIR / "term_suggestions.json"
+TERM_REVIEW_CONTEXT_PATH = PROFILE_DIR / "term_review_context.json"
 
 
 def _term_suggestions() -> dict | None:
@@ -749,9 +766,12 @@ def home() -> str:
     term_suggestion_html = ""
     if has_term_suggestions:
         n_changes = len(suggestions.get("add_terms") or []) + len(suggestions.get("remove_terms") or [])
+        n_questions = len(suggestions.get("questions") or [])
+        parts = [p for p in ([f"{n_changes} suggested change(s)"] if n_changes else []) + ([f"{n_questions} question(s)"] if n_questions else []) if p]
+        label = " · ".join(parts) or "Review available"
         term_suggestion_html = (
             f'<a href="/term-suggestions" class="mb-6 block rounded-2xl bg-amber-50 border border-amber-300 p-5 hover:bg-amber-100">'
-            f'<p class="text-xs font-semibold uppercase tracking-wide text-amber-700">Search preferences review · {n_changes} suggested change(s)</p>'
+            f'<p class="text-xs font-semibold uppercase tracking-wide text-amber-700">Search preferences review · {label}</p>'
             f'<p class="mt-1 text-sm text-amber-900">{html.escape(suggestions.get("summary") or "")}</p>'
             f'<p class="mt-2 text-xs font-semibold text-amber-700">Click to review, edit and apply &rarr;</p>'
             f'</a>'
@@ -878,7 +898,9 @@ def progress(since: int = 0) -> dict:
 @app.post("/action")
 def action(payload: JobAction) -> dict[str, bool]:
     with connection() as conn:
-        result = conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (payload.action, payload.job_id))
+        result = conn.execute(
+            "UPDATE jobs SET status = ?, status_source = 'user' WHERE id = ?", (payload.action, payload.job_id)
+        )
     if result.rowcount != 1:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
@@ -1045,12 +1067,30 @@ def term_suggestions_page() -> str:
 </div>'''
         for t in (suggestions.get("remove_terms") or [])
     ) or '<p class="text-sm text-slate-500">No removals suggested.</p>'
+    question_rows = "".join(
+        f'''<div class="rounded-lg border border-indigo-200 bg-indigo-50 p-3" data-question-row>
+<p class="text-sm font-medium text-indigo-900">{html.escape(q['question'])}</p>
+<p class="mt-1 text-xs text-indigo-700">{html.escape(q.get('context', ''))}</p>
+<div class="mt-2 flex gap-2">
+<input type="text" data-question="{html.escape(q['question'])}" placeholder="Your answer…" class="flex-1 rounded border border-slate-300 px-2 py-1 text-sm">
+<button onclick="answerQuestion(this)" class="rounded-lg bg-indigo-600 px-3 py-1 text-sm font-medium text-white">Save answer</button>
+</div>
+<p class="mt-1 text-xs text-emerald-700 hidden" data-answer-status>Saved — this becomes a confirmed fact for future reviews.</p>
+</div>'''
+        for q in (suggestions.get("questions") or [])
+    )
+    questions_section = (
+        f'<h2 class="mt-6 text-lg font-semibold text-indigo-700">Questions</h2><div class="mt-2 space-y-2">{question_rows}</div>'
+        if question_rows else ""
+    )
 
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — search preferences review</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8">
 <a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
 <h1 class="mt-2 text-2xl font-bold tracking-tight">Search preferences review</h1>
 <p class="mt-1 text-xs text-slate-500">Generated {html.escape(generated_at)}</p>
 <p class="mt-3 rounded-xl bg-amber-50 border border-amber-200 p-4 text-sm text-amber-900">{html.escape(suggestions.get("summary", ""))}</p>
+
+{questions_section}
 
 <h2 class="mt-6 text-lg font-semibold text-emerald-700">Suggested additions</h2>
 <div class="mt-2 space-y-2">{add_rows}</div>
@@ -1065,6 +1105,17 @@ def term_suggestions_page() -> str:
 <p id="apply-status" class="mt-3 text-sm"></p>
 </main>
 <script>
+async function answerQuestion(btn) {{
+  const row = btn.closest('[data-question-row]');
+  const input = row.querySelector('[data-question]');
+  const answer = input.value.trim();
+  if (!answer) return;
+  btn.disabled = true;
+  const r = await fetch('/term-suggestions/answer', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{question: input.dataset.question, answer}})}});
+  if (!r.ok) {{ btn.disabled = false; alert('Could not save answer'); return; }}
+  input.hidden = true; btn.hidden = true;
+  row.querySelector('[data-answer-status]').classList.remove('hidden');
+}}
 async function applyTermChanges() {{
   const addTerms = Array.from(document.querySelectorAll('[data-role="add"]:checked')).map(cb => {{
     const row = cb.closest('div.flex');
@@ -1111,6 +1162,26 @@ def term_suggestions_apply(payload: TermSuggestionApplyPayload) -> dict:
     return {"ok": True}
 
 
+@app.post("/term-suggestions/answer")
+def term_suggestions_answer(payload: TermQuestionAnswerPayload) -> dict:
+    """Appends one answered clarifying question to term_review_context.json
+    — read by term_review.py on every future run as a confirmed fact, so
+    the same pattern is never re-guessed or re-asked once you've settled
+    it once."""
+    context = []
+    if TERM_REVIEW_CONTEXT_PATH.exists():
+        try:
+            context = json.loads(TERM_REVIEW_CONTEXT_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            context = []
+    context.append({
+        "question": payload.question, "answer": payload.answer,
+        "answered_at": datetime.now(timezone.utc).isoformat(),
+    })
+    TERM_REVIEW_CONTEXT_PATH.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    return {"ok": True}
+
+
 @app.get("/search-terms", response_class=HTMLResponse)
 def search_terms_report() -> str:
     """How each configured active-search term is performing — found vs.
@@ -1129,6 +1200,10 @@ def search_terms_report() -> str:
                 else "bg-amber-100 text-amber-700" if rate_pct >= 50
                 else "bg-emerald-100 text-emerald-700"
             )
+            excluded_note = (
+                f' <span class="text-slate-400">({s["industry_excluded"]} industry-excluded, not counted)</span>'
+                if s.get("industry_excluded") else ""
+            )
             row_parts.append(
                 f'<tr class="border-b border-slate-100">'
                 f'<td class="py-2 pr-4 font-medium">{html.escape(s["search_term"])}</td>'
@@ -1136,7 +1211,7 @@ def search_terms_report() -> str:
                 f'<td class="py-2 pr-4 text-right">{s["found"]}</td>'
                 f'<td class="py-2 pr-4 text-right">{s["decided"]}</td>'
                 f'<td class="py-2 pr-4 text-right">{s["kept"]}</td>'
-                f'<td class="py-2 text-right"><span class="rounded-full {rate_cls} px-2 py-0.5 text-xs font-semibold">{rate_pct}% discarded</span></td>'
+                f'<td class="py-2 text-right"><span class="rounded-full {rate_cls} px-2 py-0.5 text-xs font-semibold">{rate_pct}% discarded</span>{excluded_note}</td>'
                 f'</tr>'
             )
         rows_html = (

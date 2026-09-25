@@ -13,6 +13,7 @@ backups/
 logs/
 commute_cache.json
 term_suggestions.json
+term_review_context.json
 # One-off benchmark/diagnostic exports (pilot_v*.csv, *_raw.jsonl, prompt_fix_comparison_*.csv,
 # deepseek_benchmark_*.csv, scoring_rules_introspection.txt) — scratch output, not source.
 *.csv
