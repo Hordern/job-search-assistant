@@ -325,6 +325,27 @@ def latest_ingestion_run() -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 1").fetchone()
 
 
+def latest_ingestion_run_for_email() -> sqlite3.Row | None:
+    """Most recent inbox check specifically — 'Last checked' should never
+    be silently replaced by a search-ingest run just because it happened
+    more recently; the two are different mechanisms with different
+    schedules and deserve separate status lines."""
+    with connection() as conn:
+        return conn.execute(
+            "SELECT * FROM ingestion_runs WHERE folder = 'INBOX' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
+def latest_ingestion_run_for_search() -> sqlite3.Row | None:
+    """Most recent active-search run (any connector) — the search_ingest.py
+    cycle logs one row per enabled connector each run; this is the latest
+    of those, used for a 'Last searched' status line."""
+    with connection() as conn:
+        return conn.execute(
+            "SELECT * FROM ingestion_runs WHERE folder LIKE 'search:%' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
 def run_events(run_id: int, since_id: int = 0, limit: int = 200) -> list[sqlite3.Row]:
     with connection() as conn:
         return conn.execute(

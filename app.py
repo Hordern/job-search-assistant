@@ -22,8 +22,8 @@ from pydantic import BaseModel
 
 from commute import get_commute
 from db import (
-    connection, get_job_id, init_db, latest_ingestion_run, run_events, save_job, search_term_stats,
-    toggle_favorite,
+    connection, get_job_id, init_db, latest_ingestion_run, latest_ingestion_run_for_email,
+    latest_ingestion_run_for_search, run_events, save_job, search_term_stats, toggle_favorite,
 )
 from ingest import fetch_seek_description, fingerprint
 from profile import PROFILE, PROFILE_DIR
@@ -356,7 +356,7 @@ def _dashboard_data() -> tuple[dict[str, int], str, str, bool]:
     with connection() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status").fetchall()
     counts = {row["status"]: row["count"] for row in rows}
-    run = latest_ingestion_run()
+    run = latest_ingestion_run_for_email()
     if not run:
         return counts, "Not checked yet", "Run ingest.py to check the mailbox.", True
     checked_at = datetime.fromisoformat(run["checked_at"]).astimezone(MELBOURNE)
@@ -364,12 +364,134 @@ def _dashboard_data() -> tuple[dict[str, int], str, str, bool]:
     minutes_ago = (datetime.now(MELBOURNE) - checked_at).total_seconds() / 60
     is_stale = minutes_ago > STALE_THRESHOLD_MINUTES
     detail = (
-        f"{run['folder']} · {run['emails_seen']} mailbox messages · "
+        f"{run['emails_seen']} mailbox messages · "
         f"{run['emails_processed']} newly processed · {run['job_links_found']} job links found · "
         f"{run['jobs_saved']} saved · {run['duplicates']} duplicates · {run['errors']} errors · "
         f"worker {run['worker_version'] or 'unknown'}"
     )
     return counts, checked_text, detail, is_stale
+
+
+# search_ingest.py runs every 30 min (see the search-ingest launchd plist) —
+# double that before calling it stale, same 2x-interval margin as email's
+# 15-min schedule / 30-min stale threshold.
+SEARCH_STALE_THRESHOLD_MINUTES = 60
+
+
+def _search_status() -> tuple[str, str, bool]:
+    """Separate from _dashboard_data()'s email status — active search runs
+    on its own schedule via a different mechanism (search_ingest.py, not
+    ingest.py), and silently folding the more-recently-run one into a
+    single 'Last checked' line made it look like there was only ever one
+    ingestion path, which is exactly what prompted this."""
+    run = latest_ingestion_run_for_search()
+    if not run:
+        return "Never run yet", "No active-search connector has completed a run for this profile.", True
+    checked_at = datetime.fromisoformat(run["checked_at"]).astimezone(MELBOURNE)
+    checked_text = checked_at.strftime("%Y-%m-%d %H:%M:%S %Z")
+    minutes_ago = (datetime.now(MELBOURNE) - checked_at).total_seconds() / 60
+    is_stale = minutes_ago > SEARCH_STALE_THRESHOLD_MINUTES
+    platform = run["folder"].split(":", 1)[-1] if ":" in run["folder"] else run["folder"]
+    detail = (
+        f"{platform} · {run['job_links_found']} new listing(s) found · {run['jobs_saved']} saved · "
+        f"{run['duplicates']} already tracked · {run['errors']} errors · "
+        f"worker {run['worker_version'] or 'unknown'}"
+    )
+    return checked_text, detail, is_stale
+
+
+# Shared by the main dashboard's <script> block and the single-job page
+# (/job/{id}) — every card, wherever it's rendered, wires its buttons to
+# these same functions. Plain (non-f) string: no Python substitution
+# needed, so braces are single, not doubled.
+CARD_ACTIONS_JS = """
+async function act(job_id, action) {
+  const r = await fetch('/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id, action})});
+  if (!r.ok) return alert('Could not update job');
+  location.reload();
+}
+// Single source of truth for every rescore in flight for this profile —
+// polled regardless of which tab/click started it, so reopening the page
+// (or never having clicked anything here at all) still shows accurate
+// per-button state and a page-wide badge. A rescore this specific click
+// started stays in _locallyHandled until its own fetch resolves, so this
+// poller's completion-triggered reload doesn't collide with that call's
+// own success/failure handling.
+const _locallyHandled = new Set();
+let _lastInFlightIds = new Set();
+
+async function pollRescoreQueue() {
+  try {
+    const r = await fetch('/reprocess-queue');
+    if (!r.ok) return;
+    const data = await r.json();
+    const badge = document.getElementById('rescore-queue-badge');
+    const text = document.getElementById('rescore-queue-text');
+    const inFlightIds = new Set(data.jobs.map(j => j.job_id));
+
+    // badge/text are absent on single-job pages (no page-wide queue banner
+    // there) — button syncing below still applies regardless.
+    if (badge && text) {
+      if (!data.jobs.length) {
+        badge.classList.add('hidden'); badge.classList.remove('inline-flex');
+      } else {
+        badge.classList.remove('hidden'); badge.classList.add('inline-flex');
+        text.textContent = data.jobs.length === 1
+          ? 'Rescoring "' + data.jobs[0].title + '" — ' + data.jobs[0].status
+          : 'Rescoring ' + data.jobs.length + ' jobs — ' + data.jobs.map(j => j.title).join(', ');
+      }
+    }
+
+    document.querySelectorAll('[data-rescore-btn]').forEach(btn => {
+      const id = parseInt(btn.getAttribute('data-rescore-btn'), 10);
+      const job = data.jobs.find(j => j.job_id === id);
+      if (job) {
+        btn.disabled = true;
+        btn.textContent = job.status;
+      } else if (btn.disabled && !_locallyHandled.has(id)) {
+        // Was in flight, isn't any more, and no local click is already
+        // handling its own result — it finished elsewhere/earlier while
+        // this page had it open. Reload once to pick up the new score.
+        location.reload();
+      }
+    });
+
+    _lastInFlightIds = inFlightIds;
+  } catch (e) { /* best-effort — next poll will pick it back up */ }
+}
+setInterval(pollRescoreQueue, 1000);
+pollRescoreQueue();
+
+async function rescoreJob(job_id, btn) {
+  const original = btn.textContent;
+  _locallyHandled.add(job_id);
+  btn.disabled = true;
+  btn.textContent = 'Waiting…';
+  let r;
+  try {
+    r = await fetch('/reprocess/' + job_id, {method:'POST'});
+  } finally {
+    _locallyHandled.delete(job_id);
+  }
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    alert(body.detail || 'Could not rescore job');
+    btn.disabled = false; btn.textContent = original;
+    return;
+  }
+  location.reload();
+}
+async function toggleFavorite(job_id, btn) {
+  const r = await fetch('/favorite', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id})});
+  if (!r.ok) return alert('Could not update favourite');
+  // A card can appear on several tabs at once (Today/All/Favourites), and
+  // the Favourites panel itself is only rendered server-side at page load —
+  // a full reload (same fix as act()) is simpler and more correct than
+  // hand-syncing every panel's DOM. The tab-persistence fix means this no
+  // longer loses your place.
+  location.reload();
+}
+"""
 
 
 # Dragged to the bookmarks bar and clicked on an open LinkedIn job page. Reads
@@ -482,8 +604,16 @@ ADD_SEEK_RECEIVER_HTML = """<!doctype html>
     var response = await fetch('/add-seek', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     var data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Unknown error');
+    if (data.job_id) {
+      // Single-job click (not a bulk search-results add) — land straight on
+      // that job's own page, whether it was newly added or already tracked.
+      status.textContent = data.added ? 'Added — opening it now…' : 'Already tracked — opening it now…';
+      status.className = 'success';
+      location.href = '/job/' + data.job_id;
+      return;
+    }
     var list = data.jobs.map(function(j){ return '<li>' + j.title + (j.score !== null ? ' — ' + j.score + '/100' : ' — unscored (fetch failed)') + '</li>'; }).join('');
-    status.innerHTML = 'Added ' + data.added + ' job(s), ' + data.duplicates + ' already tracked.' + (list ? '<ul>' + list + '</ul>' : '') + 'You can close this window and refresh Job Search Assistant.';
+    status.innerHTML = 'Added ' + data.added + ' job(s), ' + data.duplicates + ' already tracked.' + (list ? '<ul>' + list + '</ul>' : '') + '<a href="/">Open Job Search Assistant</a>';
     status.className = 'success';
   } catch (error) {
     status.textContent = 'Adding failed: ' + error.message;
@@ -541,8 +671,9 @@ GLASSDOOR_RECEIVER_HTML = """<!doctype html>
     var response = await fetch('/add-glassdoor', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     var data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Unknown error');
-    status.textContent = data.duplicate ? 'Already tracked.' : ('Added — ' + data.overall_score + '/100 (' + data.recommendation + '). You can close this window and refresh Job Search Assistant.');
+    status.textContent = data.duplicate ? 'Already tracked — opening it now…' : 'Added — opening it now…';
     status.className = 'success';
+    if (data.job_id) { location.href = '/job/' + data.job_id; }
   } catch (error) {
     status.textContent = 'Adding failed: ' + error.message;
     status.className = 'error';
@@ -560,6 +691,13 @@ def home() -> str:
         f"⚠ No check in over {STALE_THRESHOLD_MINUTES} min — ingest may be stuck or the launchd job isn't running"
         if is_stale else "Healthy — checking every 15 min"
     )
+    search_checked_text, search_detail, search_is_stale = _search_status()
+    search_panel_class = "mb-6 rounded-2xl p-5 text-white " + ("bg-red-900" if search_is_stale else "bg-slate-900")
+    search_dot_class = "inline-block h-2.5 w-2.5 rounded-full mr-2 " + ("bg-red-400" if search_is_stale else "bg-emerald-400")
+    search_label = (
+        f"⚠ No search in over {SEARCH_STALE_THRESHOLD_MINUTES} min — search-ingest may be stuck or the launchd job isn't running"
+        if search_is_stale else "Healthy — searching every 30 min"
+    )
     run = latest_ingestion_run()
     is_running = bool(run and run["status"] == "running")
     stat_tile = lambda label, value: (
@@ -573,89 +711,8 @@ def home() -> str:
         stat_tile("Discarded", counts.get("DISCARDED", 0)),
         stat_tile("Declined", counts.get("DECLINED", 0)),
     ])
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">Job Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
-async function act(job_id, action) {{
-  const r = await fetch('/action', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{job_id, action}})}});
-  if (!r.ok) return alert('Could not update job');
-  location.reload();
-}}
-// Single source of truth for every rescore in flight for this profile —
-// polled regardless of which tab/click started it, so reopening the page
-// (or never having clicked anything here at all) still shows accurate
-// per-button state and a page-wide badge. A rescore this specific click
-// started stays in _locallyHandled until its own fetch resolves, so this
-// poller's completion-triggered reload doesn't collide with that call's
-// own success/failure handling.
-const _locallyHandled = new Set();
-let _lastInFlightIds = new Set();
-
-async function pollRescoreQueue() {{
-  try {{
-    const r = await fetch('/reprocess-queue');
-    if (!r.ok) return;
-    const data = await r.json();
-    const badge = document.getElementById('rescore-queue-badge');
-    const text = document.getElementById('rescore-queue-text');
-    const inFlightIds = new Set(data.jobs.map(j => j.job_id));
-
-    if (!data.jobs.length) {{
-      badge.classList.add('hidden'); badge.classList.remove('inline-flex');
-    }} else {{
-      badge.classList.remove('hidden'); badge.classList.add('inline-flex');
-      text.textContent = data.jobs.length === 1
-        ? 'Rescoring "' + data.jobs[0].title + '" — ' + data.jobs[0].status
-        : 'Rescoring ' + data.jobs.length + ' jobs — ' + data.jobs.map(j => j.title).join(', ');
-    }}
-
-    document.querySelectorAll('[data-rescore-btn]').forEach(btn => {{
-      const id = parseInt(btn.getAttribute('data-rescore-btn'), 10);
-      const job = data.jobs.find(j => j.job_id === id);
-      if (job) {{
-        btn.disabled = true;
-        btn.textContent = job.status;
-      }} else if (btn.disabled && !_locallyHandled.has(id)) {{
-        // Was in flight, isn't any more, and no local click is already
-        // handling its own result — it finished elsewhere/earlier while
-        // this page had it open. Reload once to pick up the new score.
-        location.reload();
-      }}
-    }});
-
-    _lastInFlightIds = inFlightIds;
-  }} catch (e) {{ /* best-effort — next poll will pick it back up */ }}
-}}
-setInterval(pollRescoreQueue, 1000);
-pollRescoreQueue();
-
-async function rescoreJob(job_id, btn) {{
-  const original = btn.textContent;
-  _locallyHandled.add(job_id);
-  btn.disabled = true;
-  btn.textContent = 'Waiting…';
-  let r;
-  try {{
-    r = await fetch('/reprocess/' + job_id, {{method:'POST'}});
-  }} finally {{
-    _locallyHandled.delete(job_id);
-  }}
-  if (!r.ok) {{
-    const body = await r.json().catch(() => ({{}}));
-    alert(body.detail || 'Could not rescore job');
-    btn.disabled = false; btn.textContent = original;
-    return;
-  }}
-  location.reload();
-}}
-async function toggleFavorite(job_id, btn) {{
-  const r = await fetch('/favorite', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{job_id}})}});
-  if (!r.ok) return alert('Could not update favourite');
-  // A card can appear on several tabs at once (Today/All/Favourites), and
-  // the Favourites panel itself is only rendered server-side at page load —
-  // a full reload (same fix as act()) is simpler and more correct than
-  // hand-syncing every panel's DOM. The tab-persistence fix means this no
-  // longer loses your place.
-  location.reload();
-}}
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-stone-200/70 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-slate-700">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-stone-400"></span><span class="text-xs font-normal text-slate-400">Job Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today and All tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header><div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked (email) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="{search_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{search_dot_class}"></span>Last searched (active search) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(search_checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(search_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(search_detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
+{CARD_ACTIONS_JS}
 async function resync() {{
   const r = await fetch('/resync', {{method:'POST'}});
   if (!r.ok) return alert('Could not start resync');
@@ -916,6 +973,23 @@ def search_terms_report() -> str:
 </main></body></html>'''
 
 
+@app.get("/job/{job_id}", response_class=HTMLResponse)
+def job_view(job_id: int) -> str:
+    """Single-job page — same card rendering as the main dashboard, just
+    one row. Used as the landing page after an add/rescore bookmarklet
+    action on exactly one job, so the result is immediately visible
+    instead of a plain text status message."""
+    with connection() as conn:
+        row = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    body = _render_jobs([row], "")
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(row['title'] or 'job')}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8">
+<a href="/" class="text-sm text-slate-500 hover:underline">&larr; Back to dashboard</a>
+<div class="mt-4">{body}</div>
+</main><script>{CARD_ACTIONS_JS}</script></body></html>'''
+
+
 @app.get("/add-seek-bookmarklet", response_class=HTMLResponse)
 def add_seek_bookmarklet() -> str:
     """Receive add-seek bookmarklet data in the URL fragment and add it
@@ -931,12 +1005,15 @@ def add_seek(payload: AddSeekPayload) -> dict:
     scores it itself rather than relying on browser-scraped text."""
     added = []
     duplicates = 0
+    last_job_id = None
     for entry in payload.jobs:
         canonical_id = f"seek_{entry.job_id}"
         url = f"https://au.seek.com/job/{entry.job_id}"
         job_fingerprint = fingerprint(entry.company, entry.title, entry.location)
-        if get_job_id(canonical_id, job_fingerprint) is not None:
+        existing_id = get_job_id(canonical_id, job_fingerprint)
+        if existing_id is not None:
             duplicates += 1
+            last_job_id = existing_id
             continue
 
         job = {
@@ -957,10 +1034,15 @@ def add_seek(payload: AddSeekPayload) -> dict:
         new_job_id = save_job(job)
         if new_job_id is not None:
             added.append({"title": entry.title, "score": job["overall_score"]})
+            last_job_id = new_job_id
         else:
             duplicates += 1
+            last_job_id = get_job_id(canonical_id, job_fingerprint)
 
-    return {"ok": True, "added": len(added), "duplicates": duplicates, "jobs": added}
+    # Only meaningful for a single-job bookmarklet click — a search-results
+    # page can add many at once, and there's no single job to land on.
+    single_job_id = last_job_id if len(payload.jobs) == 1 else None
+    return {"ok": True, "added": len(added), "duplicates": duplicates, "jobs": added, "job_id": single_job_id}
 
 
 @app.get("/add-glassdoor-bookmarklet", response_class=HTMLResponse)
@@ -978,8 +1060,9 @@ def add_glassdoor(payload: AddGlassdoorPayload) -> dict:
     (from the user's own logged-in session) is the only source of truth."""
     canonical_id = f"glassdoor_{payload.job_id}"
     job_fingerprint = fingerprint(payload.company, payload.title, payload.location)
-    if get_job_id(canonical_id, job_fingerprint) is not None:
-        return {"ok": True, "duplicate": True}
+    existing_id = get_job_id(canonical_id, job_fingerprint)
+    if existing_id is not None:
+        return {"ok": True, "duplicate": True, "job_id": existing_id}
 
     job = {
         "canonical_id": canonical_id, "fingerprint": job_fingerprint, "platform": "glassdoor",
@@ -994,8 +1077,11 @@ def add_glassdoor(payload: AddGlassdoorPayload) -> dict:
 
     new_job_id = save_job(job)
     if new_job_id is None:
-        return {"ok": True, "duplicate": True}
-    return {"ok": True, "duplicate": False, "overall_score": evaluation["overall_score"], "recommendation": evaluation["recommendation"]}
+        return {"ok": True, "duplicate": True, "job_id": get_job_id(canonical_id, job_fingerprint)}
+    return {
+        "ok": True, "duplicate": False, "job_id": new_job_id,
+        "overall_score": evaluation["overall_score"], "recommendation": evaluation["recommendation"],
+    }
 
 
 @app.post("/resync")
