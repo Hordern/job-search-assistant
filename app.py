@@ -228,8 +228,14 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
     # Only offered when we have a stored description to rescore from — a
     # LinkedIn stub scored via the bookmarklet's one-off text never gets one
     # saved, so re-running here would just 400.
+    # A live status pill sits right next to the button and starts hidden —
+    # while a rescore is in flight the button itself is hidden (not just
+    # disabled) and this pill shown instead, so there's no interactive-
+    # looking element with changing text and no click-race window before
+    # the first poll tick lands.
     rescore_button = (
         f'''<button onclick="rescoreJob({row['id']}, this)" data-rescore-btn="{row['id']}" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50" title="Re-run scoring with the latest CV, preferences and stored job description">Rescore</button>'''
+        f'''<span data-rescore-pill="{row['id']}" hidden class="rounded-full bg-indigo-100 px-3 py-2 text-sm font-medium text-indigo-700"></span>'''
         if row["raw_description"] else ""
     )
     return f'''<article data-scored="1" data-source="{row['source'] or ''}" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
@@ -470,15 +476,25 @@ async function pollRescoreQueue() {
 
     document.querySelectorAll('[data-rescore-btn]').forEach(btn => {
       const id = parseInt(btn.getAttribute('data-rescore-btn'), 10);
+      const pill = document.querySelector('[data-rescore-pill="' + id + '"]');
       const job = data.jobs.find(j => j.job_id === id);
+      const wasInFlight = pill && !pill.hidden;
       if (job) {
-        btn.disabled = true;
-        btn.textContent = job.status;
-      } else if (btn.disabled && !_locallyHandled.has(id)) {
-        // Was in flight, isn't any more, and no local click is already
-        // handling its own result — it finished elsewhere/earlier while
-        // this page had it open. Reload once to pick up the new score.
-        location.reload();
+        // Hide the real button entirely rather than just disabling it — a
+        // disabled button with changing text still looks/behaves like a
+        // clickable control. Only the pill (no click handler at all) shows
+        // while a rescore is running.
+        btn.hidden = true;
+        if (pill) { pill.hidden = false; pill.textContent = job.status; }
+      } else {
+        btn.hidden = false;
+        if (pill) pill.hidden = true;
+        if (wasInFlight && !_locallyHandled.has(id)) {
+          // Was in flight, isn't any more, and no local click is already
+          // handling its own result — it finished elsewhere/earlier while
+          // this page had it open. Reload once to pick up the new score.
+          location.reload();
+        }
       }
     });
 
@@ -489,10 +505,13 @@ setInterval(pollRescoreQueue, 1000);
 pollRescoreQueue();
 
 async function rescoreJob(job_id, btn) {
-  const original = btn.textContent;
+  const pill = document.querySelector('[data-rescore-pill="' + job_id + '"]');
   _locallyHandled.add(job_id);
-  btn.disabled = true;
-  btn.textContent = 'Waiting…';
+  // Swap immediately, synchronously, before the network round trip —
+  // otherwise there's a real window (until the next 1s poll tick) where
+  // the button is still visible and clickable.
+  btn.hidden = true;
+  if (pill) { pill.hidden = false; pill.textContent = 'Waiting…'; }
   let r;
   try {
     r = await fetch('/reprocess/' + job_id, {method:'POST'});
@@ -502,7 +521,8 @@ async function rescoreJob(job_id, btn) {
   if (!r.ok) {
     const body = await r.json().catch(() => ({}));
     alert(body.detail || 'Could not rescore job');
-    btn.disabled = false; btn.textContent = original;
+    btn.hidden = false;
+    if (pill) pill.hidden = true;
     return;
   }
   location.reload();
