@@ -153,8 +153,17 @@ PRODUCTION_RESULTS_WANTED = 6
 
 
 def search_ingest_all(results_wanted: int = PRODUCTION_RESULTS_WANTED) -> dict[str, dict[str, int]]:
-    """Run every enabled search connector for the current profile."""
-    connectors = load_prefs().get("connectors") or {}
+    """Run every enabled search connector for the current profile — unless
+    search_enabled is false, a single master switch checked before any
+    per-connector config, so turning search off for a profile doesn't mean
+    hunting down and flipping every connector's own "enabled" individually
+    (and doesn't touch them — they're preserved for whenever it's switched
+    back on)."""
+    prefs = load_prefs()
+    if not prefs.get("search_enabled", True):
+        print("Active search is disabled for this profile (search_enabled: false in preferences.json) — skipping.")
+        return {}
+    connectors = prefs.get("connectors") or {}
     results = {}
     for platform in SEARCH_CONNECTORS:
         config = connectors.get(platform) or {}

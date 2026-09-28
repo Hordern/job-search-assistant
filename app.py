@@ -412,6 +412,8 @@ def _search_status() -> tuple[str, str, bool]:
     ingest.py), and silently folding the more-recently-run one into a
     single 'Last checked' line made it look like there was only ever one
     ingestion path, which is exactly what prompted this."""
+    if not load_prefs().get("search_enabled", True):
+        return "Disabled", "Active search is turned off for this profile (search_enabled: false) — sticking to email alerts only.", False
     run = latest_ingestion_run_for_search()
     if not run:
         return "Never run yet", "No active-search connector has completed a run for this profile.", True
@@ -755,9 +757,13 @@ def home() -> str:
         if is_stale else "Healthy — checking every 15 min"
     )
     search_checked_text, search_detail, search_is_stale = _search_status()
+    search_is_disabled = not load_prefs().get("search_enabled", True)
     search_panel_class = "mb-6 rounded-2xl p-5 text-white " + ("bg-red-900" if search_is_stale else "bg-slate-900")
-    search_dot_class = "inline-block h-2.5 w-2.5 rounded-full mr-2 " + ("bg-red-400" if search_is_stale else "bg-emerald-400")
+    search_dot_class = "inline-block h-2.5 w-2.5 rounded-full mr-2 " + (
+        "bg-slate-500" if search_is_disabled else "bg-red-400" if search_is_stale else "bg-emerald-400"
+    )
     search_label = (
+        "Off — email alerts only" if search_is_disabled else
         f"⚠ No search in over {SEARCH_STALE_THRESHOLD_MINUTES} min — search-ingest may be stuck or the launchd job isn't running"
         if search_is_stale else "Healthy — searching every 30 min"
     )
