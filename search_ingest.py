@@ -24,14 +24,18 @@ Usage:
 """
 
 import re
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from jobspy import scrape_jobs
 
-from db import finish_ingestion_run, get_job_id, log_event, save_job, start_ingestion_run
+from db import connection, finish_ingestion_run, get_job_id, log_event, save_job, start_ingestion_run
 from ingest import fingerprint
 from scorer import load_prefs, score_job
 from version import build_version
+
+MELBOURNE = ZoneInfo("Australia/Melbourne")
 
 VERSION = build_version("1.2.0")
 
@@ -152,6 +156,51 @@ def search_ingest_connector(platform: str, config: dict[str, Any], results_wante
 PRODUCTION_RESULTS_WANTED = 6
 
 
+def curate_daily_top_n(prefs: dict[str, Any]) -> int:
+    """Caps review burden, not API spend — every search-found job today
+    still gets scored as normal (this runs AFTER scoring, doesn't skip it).
+    Re-ranks all of today's (Melbourne calendar day) still-undecided
+    (status='NEW') search-sourced jobs by score and auto-discards everything
+    outside the top `search_daily_top_n`. Runs after every search_ingest_all
+    call, not once a day, since new results can arrive (and reshuffle the
+    ranking) all day — a job that was #2 at 9am can fall out of the top N by
+    3pm as better ones are found, and one that's currently excluded can
+    come back in if something worse gets Discarded/Kept by the user (which
+    removes it from this ranking entirely, freeing a slot).
+
+    Only touches status='NEW' rows — anything you've already Kept, Applied,
+    Discarded, Declined or Favourited is left alone regardless of rank.
+    Auto-discards use status_source='auto_curation', a third provenance
+    distinct from 'user' and bulk-cleanup scripts, so term_review.py's
+    genuine-discard analysis can (later) treat this differently too — this
+    wasn't the candidate rejecting the job, just review-load management."""
+    top_n = prefs.get("search_daily_top_n")
+    if not top_n or top_n <= 0:
+        return 0
+    # created_at is stored as UTC ISO8601 — comparing its date substring
+    # directly against a Melbourne-local date (as a SQL WHERE clause would)
+    # misclassifies anything within ~10-11 hours of UTC midnight, the same
+    # day-boundary bug _cards_today() in app.py already had to work around.
+    # Filter in Python against each row's actual Melbourne-local date
+    # instead.
+    today = datetime.now(MELBOURNE).date()
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT id, overall_score, created_at FROM jobs
+               WHERE source = 'search' AND status = 'NEW' AND favorited = 0
+                 AND ai_evaluation IS NOT NULL"""
+        ).fetchall()
+        todays_rows = [r for r in rows if datetime.fromisoformat(r["created_at"]).astimezone(MELBOURNE).date() == today]
+        todays_rows.sort(key=lambda r: r["overall_score"], reverse=True)
+        overflow_ids = [r["id"] for r in todays_rows[top_n:]]
+        if overflow_ids:
+            conn.executemany(
+                "UPDATE jobs SET status = 'DISCARDED', status_source = 'auto_curation' WHERE id = ?",
+                [(jid,) for jid in overflow_ids],
+            )
+    return len(overflow_ids)
+
+
 def search_ingest_all(results_wanted: int = PRODUCTION_RESULTS_WANTED) -> dict[str, dict[str, int]]:
     """Run every enabled search connector for the current profile — unless
     search_enabled is false, a single master switch checked before any
@@ -169,6 +218,9 @@ def search_ingest_all(results_wanted: int = PRODUCTION_RESULTS_WANTED) -> dict[s
         config = connectors.get(platform) or {}
         if config.get("enabled"):
             results[platform] = search_ingest_connector(platform, config, results_wanted=results_wanted)
+    curated = curate_daily_top_n(prefs)
+    if curated:
+        print(f"Auto-curated {curated} job(s) below today's top {prefs.get('search_daily_top_n')} by score.")
     return results
 
 
