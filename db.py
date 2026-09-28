@@ -38,6 +38,26 @@ def init_db() -> None:
                 processed_at TIMESTAMP NOT NULL
             );
 
+            -- A scoring failure re-raises and is caught further up the loop
+            -- WITHOUT calling mark_email_processed — deliberately, so a
+            -- transient failure (a bad network blip, a momentary API issue)
+            -- gets retried on the next 15-min cycle rather than silently
+            -- lost. But a job whose *content* deterministically triggers
+            -- Claude's JSON-escaping bug fails identically forever, and
+            -- with no cap this retried indefinitely: confirmed live, two
+            -- jobs retried 3x every single cycle for 3+ days (~240 wasted
+            -- API calls) before credit exhaustion incidentally stopped it.
+            -- This table caps that: after MAX_PERSISTENT_ATTEMPTS distinct
+            -- ingest runs have each failed on the same UID, ingest.py gives
+            -- up and saves it as a visible unscored stub instead of
+            -- retrying forever.
+            CREATE TABLE IF NOT EXISTS email_scoring_failures (
+                msg_uid INTEGER PRIMARY KEY,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TIMESTAMP NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY,
                 canonical_id TEXT UNIQUE,
@@ -149,6 +169,32 @@ def mark_email_processed(uid: int) -> None:
             "INSERT OR IGNORE INTO processed_emails (msg_uid, processed_at) VALUES (?, ?)",
             (uid, datetime.now(timezone.utc).isoformat()),
         )
+
+
+def record_scoring_failure(uid: int, error: str) -> int:
+    """Increments this UID's persistent failure count across ingest runs
+    (not the in-process 3-attempt retry, which already happened before this
+    is called) and returns the new total. A caller decides what to do once
+    it crosses their own give-up threshold."""
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO email_scoring_failures (msg_uid, attempts, last_error, last_attempt_at)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(msg_uid) DO UPDATE SET
+                attempts = attempts + 1, last_error = excluded.last_error, last_attempt_at = excluded.last_attempt_at
+            """,
+            (uid, error, datetime.now(timezone.utc).isoformat()),
+        )
+        row = conn.execute("SELECT attempts FROM email_scoring_failures WHERE msg_uid = ?", (uid,)).fetchone()
+        return row["attempts"]
+
+
+def clear_scoring_failure(uid: int) -> None:
+    """A UID that eventually scores successfully (or gets given up on and
+    saved as a stub) doesn't need its failure history kept around."""
+    with connection() as conn:
+        conn.execute("DELETE FROM email_scoring_failures WHERE msg_uid = ?", (uid,))
 
 
 def job_exists(canonical_id: str, fingerprint: str) -> bool:

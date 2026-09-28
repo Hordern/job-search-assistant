@@ -19,12 +19,12 @@ from jobspy.linkedin import LinkedIn as _LinkedInScraper
 from jobspy.model import DescriptionFormat, ScraperInput, Site
 
 from db import (
-    emails_ready_to_move, finish_ingestion_run, get_job_id, is_email_processed,
-    link_email_job, log_event, mark_email_moved, mark_email_processed, save_job,
+    clear_scoring_failure, emails_ready_to_move, finish_ingestion_run, get_job_id, is_email_processed,
+    link_email_job, log_event, mark_email_moved, mark_email_processed, record_scoring_failure, save_job,
     start_ingestion_run,
 )
 from profile import ENV_PATH, PROFILE_DIR
-from scorer import load_prefs, score_job
+from scorer import ParseFailure, load_prefs, score_job
 from version import build_version
 
 load_dotenv(ENV_PATH)
@@ -244,6 +244,19 @@ def _sweep_folders(mail: imaplib.IMAP4_SSL, run_id: int, inbox_folder: str) -> N
         mail.expunge()
 
 
+# Confirmed live (2026-09-27): a job whose content deterministically
+# triggers Claude's JSON-escaping bug fails identically every single ingest
+# cycle forever — no mark_email_processed on failure means no natural stop.
+# Two such jobs were retried 3x every 15 minutes for 3+ days (~240 wasted
+# API calls) before this cap existed. Only ParseFailure (all 3 in-process
+# retries genuinely failed to parse — the job's own content) counts toward
+# this; rate limits, API-status errors (including the credit-exhaustion
+# case that prompted this) and connection errors are external/transient
+# and must keep retrying normally once whatever's wrong externally is
+# fixed.
+MAX_PERSISTENT_SCORING_ATTEMPTS = 3
+
+
 def _describe_scoring_error(exc: Exception) -> str:
     """Turn an Anthropic SDK / scorer exception into a message that names the
     actual cause (token limit, rate limit, malformed response, ...) instead of
@@ -375,11 +388,27 @@ def ingest_alerts() -> dict[str, int]:
                         try:
                             evaluation = score_job(job["title"], job["company"], job["raw_description"])
                         except Exception as exc:
+                            error_desc = _describe_scoring_error(exc)
+                            log_event(run_id, "error", f"Failed to score \"{job['title']}\": {error_desc}")
+                            if not isinstance(exc, ParseFailure):
+                                raise
+                            attempts = record_scoring_failure(uid, error_desc)
+                            if attempts < MAX_PERSISTENT_SCORING_ATTEMPTS:
+                                raise
                             log_event(
                                 run_id, "error",
-                                f"Failed to score \"{job['title']}\": {_describe_scoring_error(exc)}",
+                                f"Giving up on \"{job['title']}\" after {attempts} failed attempts across "
+                                "separate runs — its content reliably fails to parse; saving unscored instead "
+                                "of retrying forever",
                             )
-                            raise
+                            job["ai_evaluation"] = None
+                            job["overall_score"] = None
+                            new_job_id = save_job(job)
+                            if new_job_id is not None:
+                                counts["jobs_saved"] += 1
+                                link_email_job(uid, new_job_id)
+                            clear_scoring_failure(uid)
+                            continue
                         evaluation["description_source"] = "full"
                         job["ai_evaluation"] = evaluation
                         job["overall_score"] = evaluation["overall_score"]
@@ -392,6 +421,7 @@ def ingest_alerts() -> dict[str, int]:
                                 f"Scored \"{job['title']}\": {job['overall_score']}/100 — "
                                 f"{evaluation.get('recommendation')}",
                             )
+                        clear_scoring_failure(uid)
                     mark_email_processed(uid)
                     counts["emails_processed"] += 1
                     consecutive_failures = 0
