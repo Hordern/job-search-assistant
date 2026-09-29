@@ -412,6 +412,33 @@ def finish_ingestion_run(run_id: int, counts: dict[str, int], status: str) -> No
         )
 
 
+def find_running_run(folder: str) -> sqlite3.Row | None:
+    """The current in-progress run for this folder, if any — used right
+    after a hard timeout to find which run_id to abandon. The exclusive
+    flock in ingest.py's __main__ guarantees at most one real writer per
+    profile at a time, so this is unambiguous."""
+    with connection() as conn:
+        return conn.execute(
+            "SELECT id FROM ingestion_runs WHERE folder = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+            (folder,),
+        ).fetchone()
+
+
+def abandon_stale_running_run(run_id: int, reason: str) -> None:
+    """Closes out one specific 'running' row as 'error' without touching
+    counts — used when the run that owns it was force-terminated (a hard
+    timeout, a manual kill) rather than reaching its own normal
+    finish_ingestion_run() call. Scoped to a single run_id, not "any
+    running row for this folder", so it can never clobber a genuinely
+    in-progress run started by someone else in the meantime."""
+    with connection() as conn:
+        conn.execute(
+            "UPDATE ingestion_runs SET status = 'error', finished_at = ? WHERE id = ? AND status = 'running'",
+            (datetime.now(timezone.utc).isoformat(), run_id),
+        )
+    log_event(run_id, "error", reason)
+
+
 def latest_ingestion_run() -> sqlite3.Row | None:
     with connection() as conn:
         return conn.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 1").fetchone()

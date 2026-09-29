@@ -6,6 +6,8 @@ import imaplib
 import os
 import re
 import ssl
+import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date
 from email import message_from_bytes
 from email.message import Message
@@ -19,9 +21,9 @@ from jobspy.linkedin import LinkedIn as _LinkedInScraper
 from jobspy.model import DescriptionFormat, ScraperInput, Site
 
 from db import (
-    clear_scoring_failure, emails_ready_to_move, finish_ingestion_run, get_job_id, is_email_processed,
-    link_email_job, log_event, mark_email_moved, mark_email_processed, record_scoring_failure, save_job,
-    start_ingestion_run,
+    abandon_stale_running_run, clear_scoring_failure, emails_ready_to_move, finish_ingestion_run,
+    find_running_run, get_job_id, is_email_processed, link_email_job, log_event, mark_email_moved,
+    mark_email_processed, record_scoring_failure, save_job, start_ingestion_run,
 )
 from profile import ENV_PATH, PROFILE_DIR
 from scorer import ParseFailure, load_prefs, score_job
@@ -304,7 +306,14 @@ def ingest_alerts() -> dict[str, int]:
         search_criteria = f'(SINCE "{imap_date}")'
         log_event_prefix = f"Only considering emails on/after {emails_since}"
     try:
-        with imaplib.IMAP4_SSL(imap_server) as mail:
+        # No timeout here means no timeout at all — Python's imaplib defaults
+        # to blocking forever on the underlying socket connect. Confirmed
+        # live (2026-09-30): a run got stuck indefinitely inside this
+        # constructor after the Mac woke from sleep (network not fully up
+        # yet), holding the ingest lock and leaving its ingestion_runs row
+        # stuck at 'running' forever — blocking every subsequent scheduled
+        # run too, since the lock was never released.
+        with imaplib.IMAP4_SSL(imap_server, timeout=30) as mail:
             mail.login(imap_user, imap_pass)
             status, _ = mail.select(folder, readonly=True)
             if status != "OK":
@@ -475,4 +484,36 @@ if __name__ == "__main__":
         print("Another ingest run is already in progress — skipping.")
     else:
         print(f"Job Search Assistant worker {VERSION}")
-        print(ingest_alerts())
+        # A plain socket `timeout=` on IMAP4_SSL is not reliable enough on
+        # its own — confirmed live (2026-09-30): a run still blocked
+        # indefinitely (7+ minutes, no error) on an SSL read well past a
+        # 30s socket timeout, the same class of problem as jobspy's
+        # tls_client not honouring its own timeout either. A hard external
+        # bound in a worker thread guarantees this process gives up and
+        # releases the lock within INGEST_HARD_TIMEOUT_SECONDS regardless
+        # of what the IMAP library is actually doing underneath.
+        INGEST_HARD_TIMEOUT_SECONDS = 300
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ingest_alerts)
+        try:
+            print(future.result(timeout=INGEST_HARD_TIMEOUT_SECONDS))
+        except FuturesTimeoutError:
+            folder = os.environ.get("IMAP_FOLDER", "INBOX")
+            stuck_run = find_running_run(folder)
+            if stuck_run:
+                abandon_stale_running_run(
+                    stuck_run["id"],
+                    f"Hard timeout — run exceeded {INGEST_HARD_TIMEOUT_SECONDS}s, abandoning",
+                )
+            print(f"Ingest run exceeded {INGEST_HARD_TIMEOUT_SECONDS}s — abandoned, see logs")
+            sys.stdout.flush()  # os._exit() skips normal flush-on-exit — confirmed this print was
+            # otherwise silently lost (stdout is fully buffered once redirected to a file/launchd log)
+            # ThreadPoolExecutor registers an atexit hook that joins every
+            # submitted thread before the interpreter is allowed to exit —
+            # normal shutdown (even shutdown(wait=False)) would still block
+            # here waiting for the stuck worker. The DB is already cleaned
+            # up above; os._exit() skips all further Python-level cleanup
+            # and actually terminates the process now, which is the entire
+            # point of a hard timeout (releasing the flock lock promptly so
+            # the next scheduled run isn't blocked behind this one).
+            os._exit(1)
