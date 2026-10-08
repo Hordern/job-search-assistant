@@ -22,3 +22,5 @@ term_review_context.json
 *.jsonl
 scoring_rules_introspection.txt
 watchdog_state.json
+.batch.lock
+batch_last_error.json
