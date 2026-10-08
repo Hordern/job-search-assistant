@@ -150,3 +150,30 @@ All three stack independently and don't conflict:
 None of them required a model change or a quality tradeoff — same model,
 same accuracy, verified against real production prompts and real stored
 jobs before being kept.
+
+## 4. Batch API for anything that isn't latency-sensitive (50% off)
+
+The Message Batches API bills every token (input, output, cache) at **50%**
+in exchange for asynchronous results - most batches finish within an hour,
+24h worst case. If a human isn't waiting on the answer, this is the biggest
+single lever once thinking is off: output tokens dominate this app's bill and
+batch halves them.
+
+How it was fitted here (`batch_scoring.py`, enabled per profile with
+`"batch_scoring": true` in preferences.json):
+- A dependent multi-step pipeline becomes one batch per step. Ingest saves
+  the job unscored and queues it; a launchd job runs every 3 minutes,
+  collects finished batches, advances each job one stage, and submits the next
+  stage as a new batch. State lives in a `scoring_queue` table so a crash
+  just resumes. Measured: 4 jobs went extract -> match in about 6 minutes.
+- Keep user-initiated paths (rescore button, bookmarklets) synchronous.
+- Reuse the same parsing/validation/scoring functions as the synchronous path
+  (`hard_disqualified_result`, `merge_audit_and_dedupe`, `finish_scoring`) so
+  batch and non-batch results can't drift apart.
+- **Prompt caching is best-effort inside a batch.** Requests run concurrently,
+  so most write the shared prefix instead of reading it (measured 3 writes + 1
+  read per stage on a 4-job batch). Don't pay for the 1-hour TTL to fix that -
+  the write premium (2x vs 1.25x) outweighs the few extra hits.
+- Record a `batch` flag in the per-call usage log so spend reports can apply
+  the discount (`cost_report.py` does).
+- Release valve: flip the preference to false and scoring goes back inline.

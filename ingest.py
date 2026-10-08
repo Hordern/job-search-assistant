@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from jobspy.linkedin import LinkedIn as _LinkedInScraper
 from jobspy.model import DescriptionFormat, ScraperInput, Site
 
+import batch_scoring
 from db import (
     abandon_stale_running_run, clear_scoring_failure, emails_ready_to_move, finish_ingestion_run,
     find_running_run, get_job_id, is_email_processed, link_email_job, log_event, mark_email_moved,
@@ -391,6 +392,26 @@ def ingest_alerts() -> dict[str, int]:
                                     run_id, "info",
                                     f"Skipped scoring \"{job['title']}\" ({hint})",
                                 )
+                            continue
+
+                        if load_prefs().get("batch_scoring", False):
+                            # Half-price path: save the job unscored and queue it;
+                            # batch_scoring.py (its own launchd job) scores it a few
+                            # minutes later via the Message Batches API. Flip
+                            # "batch_scoring" to false in preferences.json to go back
+                            # to scoring inline.
+                            job["ai_evaluation"] = None
+                            job["overall_score"] = None
+                            new_job_id = save_job(job)
+                            if new_job_id is not None:
+                                counts["jobs_saved"] += 1
+                                link_email_job(uid, new_job_id)
+                                batch_scoring.enqueue(new_job_id)
+                                log_event(
+                                    run_id, "info",
+                                    f"Queued \"{job['title']}\" at {job['company']} for batch scoring",
+                                )
+                            clear_scoring_failure(uid)
                             continue
 
                         log_event(run_id, "info", f"Scoring \"{job['title']}\" at {job['company']}…")

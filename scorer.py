@@ -1282,7 +1282,7 @@ def _anthropic_call(client: Anthropic, prompt: str | CachedPrompt, max_tokens: i
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def _log_usage(usage: Any) -> None:
+def _log_usage(usage: Any, batch: bool = False) -> None:
     """One JSON line per API call in the profile dir — Anthropic's billing
     ledger isn't reachable from here without an Admin key, and without this
     there was no way to confirm caching/thinking changes actually moved the
@@ -1295,6 +1295,7 @@ def _log_usage(usage: Any) -> None:
             "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
             "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
             "output": usage.output_tokens,
+            "batch": batch,  # billed at 50% - cost_report.py applies the discount
         }
         with (PROFILE_DIR / "api_usage.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")

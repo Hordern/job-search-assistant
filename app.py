@@ -276,8 +276,23 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
 </article>'''
 
 
+def _queued_job_ids() -> set[int]:
+    """Jobs waiting on batch scoring (see batch_scoring.py). The table only
+    exists once a profile has used batch scoring, so a missing table just
+    means nothing is queued."""
+    try:
+        with connection() as conn:
+            return {r["job_id"] for r in conn.execute("SELECT job_id FROM scoring_queue")}
+    except sqlite3.OperationalError:
+        return set()
+
+
 def _unscored_card(row: sqlite3.Row, buttons_html: str) -> str:
-    hint = (
+    if row["id"] in _queued_job_ids():
+        hint = "Queued for scoring - batch scoring usually finishes within about 15 minutes. Refresh to see the score."
+    else:
+        hint = None
+    hint = hint or (
         "No full listing available yet — open it on LinkedIn while logged in and use the "
         "rescore bookmarklet above to get a real score."
         if row["platform"] == "linkedin"
@@ -445,6 +460,7 @@ _WATCHDOG_ISSUE_COPY = {
     "email_stale": ("Email ingest looks stuck", "Restart email ingest now", "/resync"),
     "search_stale": ("Search ingest looks stuck", "Restart search ingest now", "/watchdog/fix/search_stale"),
     "term_review_stale": ("Daily term review hasn't completed", "Run term review now", "/watchdog/fix/term_review_stale"),
+    "batch_queue_stuck": ("Jobs are stuck waiting for batch scoring", "Run a batch scoring cycle now", "/watchdog/fix/batch_queue_stuck"),
 }
 
 
@@ -1457,6 +1473,7 @@ def resync() -> dict[str, bool]:
 _WATCHDOG_FIX_SCRIPTS = {
     "search_stale": Path(__file__).with_name("search_ingest.py"),
     "term_review_stale": Path(__file__).with_name("term_review.py"),
+    "batch_queue_stuck": Path(__file__).with_name("batch_scoring.py"),
 }
 
 

@@ -22,19 +22,22 @@ so a batch-scored job is identical to a synchronously scored one.
 Usage: JOBSEARCH_PROFILE=alice python batch_scoring.py
 """
 
+import fcntl
 import json
 import sys
 from datetime import datetime, timezone
 
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError, BadRequestError, PermissionDeniedError
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
 import scorer
 from db import connection
-from profile import PROFILE
+from profile import PROFILE, PROFILE_DIR
 
 MAX_ATTEMPTS = 3
+LOCK_PATH = PROFILE_DIR / ".batch.lock"
+ERROR_PATH = PROFILE_DIR / "batch_last_error.json"
 # Default 5-minute TTL on purpose. Measured on a 4-job test batch (2026-10-08):
 # requests in a batch run concurrently, so most of them each WRITE the shared
 # prefix rather than read it (3 writes + 1 read per stage) - cache hits inside
@@ -63,6 +66,7 @@ def ensure_schema() -> None:
 def enqueue(job_id: int) -> None:
     """Called by ingest in place of score_job(): the job row is already saved
     with ai_evaluation NULL; this just registers it for the next batch."""
+    ensure_schema()
     with connection() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO scoring_queue (job_id, stage, created_at) VALUES (?, 'extract', ?)",
@@ -124,6 +128,7 @@ def submit_pending(client: Anthropic) -> int:
             conn.executemany(
                 "UPDATE scoring_queue SET batch_id = ? WHERE job_id = ?", [(batch.id, r["job_id"]) for r in rows]
             )
+            conn.commit()
             submitted += len(rows)
             print(f"[{PROFILE}] submitted {stage} batch {batch.id}: {len(rows)} job(s)")
     return submitted
@@ -204,9 +209,10 @@ def collect_finished(client: Anthropic) -> int:
                     continue  # already handled, or re-queued under a newer batch
                 text = None
                 if result.result.type == "succeeded":
-                    scorer._log_usage(result.result.message.usage)
+                    scorer._log_usage(result.result.message.usage, batch=True)
                     text = "".join(b.text for b in result.result.message.content if b.type == "text")
                 _advance(conn, row, _job(conn, job_id), text)
+                conn.commit()  # keep the write lock short - the next call is a network round trip
             done += 1
     return done
 
@@ -216,8 +222,15 @@ def run_cycle() -> None:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
     ensure_schema()
     client = Anthropic()
-    collected = collect_finished(client)
-    submitted = submit_pending(client)
+    try:
+        collected = collect_finished(client)
+        submitted = submit_pending(client)
+    except (AuthenticationError, BadRequestError, PermissionDeniedError) as exc:
+        # Key revoked / credit exhausted: the same failures the synchronous path
+        # logs to ingestion_events. Leave a marker for watchdog.py and re-raise.
+        ERROR_PATH.write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "message": str(exc)[:300]}))
+        raise
+    ERROR_PATH.unlink(missing_ok=True)
     with connection() as conn:
         waiting = conn.execute("SELECT stage, count(*) n FROM scoring_queue GROUP BY stage").fetchall()
     print(f"[{PROFILE}] collected {collected} batch(es), submitted {submitted} job(s); queue: "
@@ -225,4 +238,12 @@ def run_cycle() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(run_cycle())
+    # One cycle at a time: two overlapping runs would each submit the same
+    # waiting rows (batch_id IS NULL) and pay for them twice.
+    lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another batch scoring cycle is already running - skipping.")
+        sys.exit(0)
+    run_cycle()

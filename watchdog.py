@@ -12,6 +12,7 @@ Usage: JOBSEARCH_PROFILE=alice python watchdog.py
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import urllib.request
@@ -45,7 +46,10 @@ LAUNCHD_LABELS = {
     "ingest": f"com.example.jobsearch.ingest{_SUFFIX}",
     "search-ingest": f"com.example.jobsearch.search-ingest{_SUFFIX}",
     "term-review": f"com.example.jobsearch.term-review{_SUFFIX}",
+    "batch-score": f"com.example.jobsearch.batch-score{_SUFFIX}",
 }
+BATCH_QUEUE_STUCK_MINUTES = 120  # batches normally finish in minutes, 24h worst case
+BATCH_ERROR_PATH = PROFILE_DIR / "batch_last_error.json"
 
 
 def _minutes_since(iso_timestamp: str) -> float:
@@ -110,6 +114,39 @@ def _check_scoring_failing() -> str | None:
     if "credit balance" in row["message"]:
         return "Scoring is failing: Anthropic credit balance is too low — top up at console.anthropic.com."
     return "Scoring is failing: the Anthropic API key is invalid or revoked — create a new key and update users/*/.env."
+
+
+def _check_batch_queue_stuck() -> str | None:
+    """Jobs saved by ingest but never scored: the batch runner isn't draining
+    the scoring_queue table. The table only exists once batch scoring has
+    been used."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=BATCH_QUEUE_STUCK_MINUTES)).isoformat()
+    try:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT count(*) n, min(created_at) oldest FROM scoring_queue WHERE created_at < ?", (cutoff,)
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row["n"]:
+        return (f"{row['n']} job(s) have been waiting for batch scoring for over {BATCH_QUEUE_STUCK_MINUTES} min "
+                f"(oldest queued {row['oldest'][:16]} UTC).")
+    return None
+
+
+def _check_batch_api_failing() -> str | None:
+    """batch_scoring.py can't write to ingestion_events (no run), so it leaves
+    batch_last_error.json on an auth/credit failure and removes it on the next
+    clean cycle."""
+    if not BATCH_ERROR_PATH.exists():
+        return None
+    try:
+        err = json.loads(BATCH_ERROR_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if "credit balance" in err.get("message", ""):
+        return "Batch scoring is failing: Anthropic credit balance is too low - top up at console.anthropic.com."
+    return f"Batch scoring is failing: {err.get('message', 'unknown API error')[:120]}"
 
 
 def _check_term_review_stale() -> str | None:
@@ -178,6 +215,11 @@ def main() -> None:
     scoring_problem = _check_scoring_failing()
     if scoring_problem:
         problems["scoring_failing"] = scoring_problem
+
+    for key, check in (("batch_queue_stuck", _check_batch_queue_stuck), ("scoring_failing", _check_batch_api_failing)):
+        problem = check()
+        if problem:
+            problems.setdefault(key, problem)
 
     term_review_problem = _check_term_review_stale()
     if term_review_problem:
