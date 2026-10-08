@@ -26,7 +26,7 @@ from anthropic import Anthropic
 
 from db import connection, search_term_stats
 from profile import PROFILE_DIR
-from scorer import MODEL, load_prefs
+from scorer import MODEL, _log_usage, load_prefs
 
 SUGGESTIONS_PATH = PROFILE_DIR / "term_suggestions.json"
 CONTEXT_PATH = PROFILE_DIR / "term_review_context.json"
@@ -156,7 +156,28 @@ Return ONLY a JSON object with exactly this schema:
 Empty arrays where there's nothing to say. has_suggestions is true if add_terms, remove_terms, OR questions is non-empty."""
 
 
+# The launchd job fires daily at 6:30, but a run costs ~$0.25 (large prompt,
+# reasoning over every Keep/Discard) and the underlying signal changes slowly.
+# 60h (not 72h) so a run finishing at 6:33 isn't skipped by the 6:30 trigger
+# three days later - gives roughly one run every 3 days. --force overrides it
+# (used by the dashboard's "Run term review now" button).
+_MIN_HOURS_BETWEEN_RUNS = 60
+
+
+def _recently_generated() -> bool:
+    if "--force" in sys.argv or not SUGGESTIONS_PATH.exists():
+        return False
+    try:
+        generated = datetime.fromisoformat(json.loads(SUGGESTIONS_PATH.read_text(encoding="utf-8"))["generated_at"])
+    except (json.JSONDecodeError, OSError, KeyError, ValueError):
+        return False
+    return (datetime.now(timezone.utc) - generated).total_seconds() < _MIN_HOURS_BETWEEN_RUNS * 3600
+
+
 def run(profile: str) -> None:
+    if _recently_generated():
+        print(f"[{profile}] Skipped - last review under {_MIN_HOURS_BETWEEN_RUNS}h ago (use --force to run anyway)")
+        return
     prefs = load_prefs()
     signal = _signal_jobs()
     total_signal = sum(len(v) for v in signal.values())
@@ -180,7 +201,16 @@ def run(profile: str) -> None:
 
     client = Anthropic()
     prompt = build_prompt(profile, prefs, signal, stats, _load_cv(), context)
-    response = client.messages.create(model=MODEL, max_tokens=4096, messages=[{"role": "user", "content": prompt}])
+    # 4096 was too low and silently broke this: verified live (2026-10-02)
+    # that on a large signal set the model's default adaptive thinking (on
+    # by default when `thinking` isn't set — not "no thinking" like older
+    # models) consumed the entire budget before writing any JSON, giving
+    # stop_reason="max_tokens" with zero text output. Unlike scorer.py's
+    # deterministic extraction calls, this task does real cross-job pattern
+    # analysis, so thinking is left on (not disabled) — just given enough
+    # room to finish. See CLAUDE_API_COST_NOTES.md.
+    response = client.messages.create(model=MODEL, max_tokens=16000, metadata={"user_id": f"jobsearch-{profile}-term-review"}, messages=[{"role": "user", "content": prompt}])
+    _log_usage(response.usage)
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0]

@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -259,7 +259,7 @@ def _scored_card(row: sqlite3.Row, buttons_html: str) -> str:
   {summary_html}
   <p class="mt-4 text-sm"><span class="font-semibold">Pitch angle:</span> {html.escape(str(evaluation.get('pitch_angle') or 'Not available'))}</p>
   <div class="mt-3 flex flex-wrap gap-2 text-xs">
-    <span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">CV fit: {evaluation.get('cv_fit_score', '—')}</span>
+    <span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">CV fit: {evaluation.get('cv_fit_score') if evaluation.get('cv_fit_score') is not None else '—'}</span>
     {fit_tag('Salary', salary_fit, fit_cls(salary_fit))}
     {fit_tag('Location', location_fit, fit_cls(location_fit))}
     {_distance_badge(evaluation)}
@@ -355,7 +355,7 @@ def _cards_all(empty_message: str) -> str:
     return _render_jobs(rows, empty_message)
 
 
-def _cards_today(empty_message: str) -> str:
+def _todays_new_rows() -> list[sqlite3.Row]:
     """Same untriaged set as _cards_all, filtered to jobs created today in
     Melbourne time — done in Python rather than SQL since created_at is
     stored as UTC ISO8601 and SQLite's date functions don't handle the
@@ -363,8 +363,11 @@ def _cards_today(empty_message: str) -> str:
     today = datetime.now(MELBOURNE).date()
     with connection() as conn:
         rows = conn.execute(f"SELECT {_CARD_FIELDS} FROM jobs WHERE status = 'NEW'").fetchall()
-    todays_rows = [r for r in rows if datetime.fromisoformat(r["created_at"]).astimezone(MELBOURNE).date() == today]
-    return _render_jobs(todays_rows, empty_message)
+    return [r for r in rows if datetime.fromisoformat(r["created_at"]).astimezone(MELBOURNE).date() == today]
+
+
+def _cards_today(empty_message: str) -> str:
+    return _render_jobs(_todays_new_rows(), empty_message)
 
 
 def _cards_favorites(empty_message: str) -> str:
@@ -428,6 +431,62 @@ def _search_status() -> tuple[str, str, bool]:
         f"worker {run['worker_version'] or 'unknown'}"
     )
     return checked_text, detail, is_stale
+
+
+WATCHDOG_STATE_PATH = PROFILE_DIR / "watchdog_state.json"
+
+# Human label + recommended-action copy for each problem key watchdog.py can
+# report (see watchdog.py main()). "fixable" controls whether a button is
+# offered at all — dashboard_unreachable has none on purpose: if you're
+# looking at this page, the dashboard obviously isn't unreachable right now,
+# and a hung dashboard could never have served this button anyway (that's
+# what sidecar.py is for, see watchdog.py's _check_dashboard_unreachable).
+_WATCHDOG_ISSUE_COPY = {
+    "email_stale": ("Email ingest looks stuck", "Restart email ingest now", "/resync"),
+    "search_stale": ("Search ingest looks stuck", "Restart search ingest now", "/watchdog/fix/search_stale"),
+    "term_review_stale": ("Daily term review hasn't completed", "Run term review now", "/watchdog/fix/term_review_stale"),
+}
+
+
+def _watchdog_issues_html() -> str:
+    if not WATCHDOG_STATE_PATH.exists():
+        return ""
+    try:
+        issues = json.loads(WATCHDOG_STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not issues:
+        return ""
+
+    rows = []
+    for key, message in issues.items():
+        if key == "dashboard_unreachable":
+            continue  # see _WATCHDOG_ISSUE_COPY comment — no button is possible here
+        if key in _WATCHDOG_ISSUE_COPY:
+            title, button_label, endpoint = _WATCHDOG_ISSUE_COPY[key]
+        elif key.startswith("launchd_") and key.endswith("_unloaded"):
+            name = key[len("launchd_"):-len("_unloaded")]
+            title, button_label, endpoint = (f"'{name}' isn't loaded in launchd", f"Reload {name}", f"/watchdog/fix/{key}")
+        else:
+            title, button_label, endpoint = (key.replace("_", " ").title(), None, None)
+        button_html = (
+            f"<button onclick='watchdogFix({json.dumps(endpoint)}, this)' "
+            f'class="mt-2 rounded-lg bg-white px-3 py-1.5 text-sm font-medium text-amber-900 hover:bg-amber-100">'
+            f'{html.escape(button_label)}</button>'
+            if button_label else ""
+        )
+        rows.append(
+            f'<div class="border-t border-amber-200 pt-3 first:border-t-0 first:pt-0">'
+            f'<p class="text-sm font-semibold text-amber-900">{html.escape(title)}</p>'
+            f'<p class="text-xs text-amber-700">{html.escape(message)}</p>{button_html}</div>'
+        )
+    if not rows:
+        return ""
+    return (
+        '<section class="mb-6 rounded-2xl bg-amber-50 border border-amber-300 p-5">'
+        '<p class="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-3">⚠ Issues detected</p>'
+        f'<div class="space-y-3">{"".join(rows)}</div></section>'
+    )
 
 
 TERM_SUGGESTIONS_PATH = PROFILE_DIR / "term_suggestions.json"
@@ -767,6 +826,7 @@ def home() -> str:
         f"⚠ No search in over {SEARCH_STALE_THRESHOLD_MINUTES} min — search-ingest may be stuck or the launchd job isn't running"
         if search_is_stale else "Healthy — searching every 30 min"
     )
+    watchdog_issues_html = _watchdog_issues_html()
     suggestions = _term_suggestions()
     has_term_suggestions = bool(suggestions and suggestions.get("has_suggestions"))
     term_suggestion_html = ""
@@ -789,17 +849,29 @@ def home() -> str:
         f'<p class="text-2xl font-bold">{value}</p></div>'
     )
     stats_html = "".join([
-        stat_tile("New", counts.get("NEW", 0)),
+        stat_tile("Today", len(_todays_new_rows())),
         stat_tile("To process", counts.get("TO_PROCESS", 0)),
         stat_tile("Applied", counts.get("APPLIED", 0)),
         stat_tile("Discarded", counts.get("DISCARDED", 0)),
         stat_tile("Declined", counts.get("DECLINED", 0)),
     ])
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-indigo-100 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-indigo-900">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-indigo-300"></span><span class="text-xs font-normal text-indigo-500">Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today, All and To process tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><button id="source-filter-toggle" onclick="cycleSourceFilter()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">All sources</button><span class="mt-3 ml-2 inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium"><label for="min-score-filter" class="text-slate-500">Min score</label><input type="number" id="min-score-filter" oninput="applyCardFilters()" min="0" max="100" placeholder="0" class="w-14 rounded border border-slate-300 px-1 py-0.5 text-sm"></span><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header>{term_suggestion_html}<div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked (email) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="{search_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{search_dot_class}"></span>Last searched (active search) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(search_checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(search_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(search_detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-toprocess" onclick="showTab('toprocess')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">To process</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-toprocess" hidden class="mb-8"><div class="space-y-4">{_cards("TO_PROCESS", "Nothing kept yet — click Keep on a job in Today or All to shortlist it here.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>Job Search Assistant — {html.escape(PROFILE)}</title></head><body class="bg-slate-50 text-slate-900"><main class="mx-auto max-w-2xl p-4 sm:p-8"><header class="mb-6"><div class="mb-3 inline-flex items-center gap-2.5 rounded-full bg-indigo-100 px-5 py-2.5 shadow-sm"><span class="text-base font-semibold tracking-wide text-indigo-900">{html.escape(PROFILE.capitalize())}</span><span class="h-1 w-1 rounded-full bg-indigo-300"></span><span class="text-xs font-normal text-indigo-500">Search Assistant v{VERSION}</span></div><h1 class="text-3xl font-bold tracking-tight text-slate-900">Daily job digest</h1><p class="mt-2 text-slate-600">Ranked opportunities from your email alerts. The Today, All and To process tabs are each ranked highest-score-first <em>within themselves</em>.</p><p class="mt-2 text-xs text-slate-500">Drag to your bookmarks bar: <a href="{RESCORE_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Rescore LinkedIn job</a> — open a LinkedIn job page while logged in, then click it to score with the full listing. <a href="{ADD_SEEK_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add SEEK job(s)</a> — open a SEEK job page or search results page, then click it to add that job (or every job on the page) to the tracker. <a href="{GLASSDOOR_BOOKMARKLET_HREF}" class="rounded bg-slate-200 px-2 py-1 font-semibold text-slate-700">Add Glassdoor job</a> — open a Glassdoor job page while logged in, then click it to add and score that job (unverified selectors — first try may need a follow-up fix).</p><button onclick="resync()" class="mt-3 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-white">Resync now</button><button id="unscored-toggle" onclick="toggleUnscored()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Show unscored only</button><button id="source-filter-toggle" onclick="cycleSourceFilter()" class="mt-3 ml-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">All sources</button><span class="mt-3 ml-2 inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium"><label for="min-score-filter" class="text-slate-500">Min score</label><input type="number" id="min-score-filter" oninput="applyCardFilters()" min="0" max="100" placeholder="0" class="w-14 rounded border border-slate-300 px-1 py-0.5 text-sm"></span><a href="/search-terms" class="mt-3 ml-2 inline-block rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Search term performance</a></header>{watchdog_issues_html}{term_suggestion_html}<div id="rescore-queue-badge" class="mb-4 hidden items-center gap-2 rounded-full bg-indigo-100 px-4 py-2 text-sm font-medium text-indigo-700"><span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span><span id="rescore-queue-text"></span></div><section id="progress-panel" {"" if is_running else "hidden"} class="mb-6 rounded-2xl bg-slate-900 p-5 text-white"><p class="text-xs font-semibold uppercase tracking-wide text-amber-400">Worker running…</p><div id="progress-events" class="mt-2 max-h-48 overflow-y-auto space-y-0.5 font-mono"></div></section><section class="{heartbeat_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{heartbeat_dot_class}"></span>Last checked (email) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(heartbeat_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(detail)}</p></section><section class="{search_panel_class}"><p class="text-xs font-semibold uppercase tracking-wide text-slate-300"><span class="{search_dot_class}"></span>Last searched (active search) · Melbourne time</p><p class="mt-1 text-lg font-semibold">{html.escape(search_checked_text)}</p><p class="mt-1 text-sm font-semibold">{html.escape(search_label)}</p><p class="mt-2 text-sm text-slate-300">{html.escape(search_detail)}</p></section><section class="mb-8 grid grid-cols-2 sm:grid-cols-5 gap-3">{stats_html}</section><div class="mb-4 flex gap-2 border-b border-slate-200"><button id="tab-btn-today" onclick="showTab('today')" class="px-4 py-2 text-sm font-semibold border-b-2 border-indigo-600 text-indigo-700">Today</button><button id="tab-btn-all" onclick="showTab('all')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">All</button><button id="tab-btn-toprocess" onclick="showTab('toprocess')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">To process</button><button id="tab-btn-favorites" onclick="showTab('favorites')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">♥ Favourites</button><button id="tab-btn-applied" onclick="showTab('applied')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-500">✓ Applied</button></div><section id="tab-panel-today" class="mb-8"><div class="space-y-4">{_cards_today("No jobs added today yet.")}</div></section><section id="tab-panel-all" hidden class="mb-8"><div class="space-y-4">{_cards_all("Nothing active right now.")}</div></section><section id="tab-panel-toprocess" hidden class="mb-8"><div class="space-y-4">{_cards("TO_PROCESS", "Nothing kept yet — click Keep on a job in Today or All to shortlist it here.")}</div></section><section id="tab-panel-favorites" hidden class="mb-8"><div class="space-y-4">{_cards_favorites("No favourites yet — click the heart on a job to save it here.")}</div></section><section id="tab-panel-applied" hidden class="mb-8"><div class="mb-3 flex gap-2"><input type="search" id="applied-search" oninput="filterApplied()" placeholder="Quick find — company or title (e.g. for a call)…" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"><a href="/export/applied.csv" class="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium whitespace-nowrap">Export CSV</a></div><div id="applied-cards" class="space-y-4">{_cards("APPLIED", "Nothing applied to yet.")}</div></section></main><script>
 {CARD_ACTIONS_JS}
 async function resync() {{
   const r = await fetch('/resync', {{method:'POST'}});
   if (!r.ok) return alert('Could not start resync');
+  location.reload();
+}}
+async function watchdogFix(endpoint, btn) {{
+  btn.disabled = true;
+  btn.textContent = 'Working…';
+  try {{
+    const r = await fetch(endpoint, {{method:'POST'}});
+    const data = await r.json();
+    alert(data.message || (r.ok ? 'Done.' : 'Fix failed.'));
+  }} catch (e) {{
+    alert('Could not reach the server: ' + e);
+  }}
   location.reload();
 }}
 let showUnscoredOnly = false;
@@ -1376,3 +1448,51 @@ def resync() -> dict[str, bool]:
         start_new_session=True,
     )
     return {"ok": True}
+
+
+# Scripts the "Issues detected" panel can kick off on demand, keyed by the
+# watchdog_state.json problem key it fixes. Same pkill-then-relaunch pattern
+# as /resync, generalised — none of these take a lock file the way ingest.py
+# does, so there's no unlink step.
+_WATCHDOG_FIX_SCRIPTS = {
+    "search_stale": Path(__file__).with_name("search_ingest.py"),
+    "term_review_stale": Path(__file__).with_name("term_review.py"),
+}
+
+
+@app.post("/watchdog/fix/{issue_key}")
+def watchdog_fix(issue_key: str) -> dict[str, Any]:
+    """Recovery actions for the problems watchdog.py can detect but can't
+    safely act on itself (that line is deliberate, see CLAUDE_API_COST_NOTES.md
+    and watchdog.py's module docstring — only the hung-dashboard case
+    auto-recovers, via the separate sidecar.py, because it's the one case
+    where no dashboard button could ever be clicked)."""
+    if issue_key in _WATCHDOG_FIX_SCRIPTS:
+        script = _WATCHDOG_FIX_SCRIPTS[issue_key]
+        match_pattern = f"{script} {PROFILE}"
+        subprocess.run(["pkill", "-f", match_pattern])
+        for _ in range(20):
+            if subprocess.run(["pgrep", "-f", match_pattern], capture_output=True).returncode != 0:
+                break
+            time.sleep(0.1)
+        subprocess.Popen(
+            [sys.executable, str(script), PROFILE, *(["--force"] if issue_key == "term_review_stale" else [])],
+            cwd=script.parent,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"ok": True, "message": f"Restarted {script.name}."}
+
+    if issue_key.startswith("launchd_") and issue_key.endswith("_unloaded"):
+        name = issue_key[len("launchd_"):-len("_unloaded")]
+        suffix = "" if PROFILE == "alice" else f".{PROFILE}"
+        label = f"com.example.jobsearch.{name}{suffix}"
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if not plist_path.exists():
+            return {"ok": False, "message": f"No plist found at {plist_path} — can't reload a job that was never installed."}
+        result = subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True, text=True)
+        if result.returncode == 0:
+            return {"ok": True, "message": f"Loaded {label}."}
+        return {"ok": False, "message": f"launchctl load failed: {result.stderr.strip()}"}
+
+    raise HTTPException(status_code=404, detail=f"No automatic fix known for '{issue_key}'.")

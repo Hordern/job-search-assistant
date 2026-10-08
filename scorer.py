@@ -30,20 +30,32 @@ capability match_state field once eligibility items were mixed into that
 same array.
 """
 
+import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Callable
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from profile import BASE_DIR, ENV_PATH, PROFILE_DIR
+from profile import BASE_DIR, ENV_PATH, PROFILE, PROFILE_DIR
 
 load_dotenv(ENV_PATH)
 
 CV_PATH = PROFILE_DIR / os.environ.get("CV_PATH", "cv_scoring_full.txt")
+# The file you actually paste a fresh/updated CV into. CV_PATH above is the
+# derived file actually fed to the model — auto-(re)compressed from this one
+# whenever its content changes, see _load_cv(). Not every profile needs
+# this: if it's absent, CV_PATH is used directly and unmanaged (legacy mode).
+CV_FULL_PATH = PROFILE_DIR / os.environ.get("CV_FULL_PATH", "cv_full.txt")
+_CV_HASH_PATH = CV_PATH.with_name(CV_PATH.name + ".hash")
+# Below this, compression has nothing meaningful to gain and just adds
+# rewrite risk for a CV that was never the cost driver — copy through as-is.
+_CV_COMPRESSION_THRESHOLD_CHARS = 8000
 PREFS_PATH = PROFILE_DIR / os.environ.get("PREFS_PATH", "preferences.json")
 # The scoring methodology (wording, extraction schemas) is shared across
 # every profile and lives in one place, separate from personal data — edit
@@ -79,12 +91,111 @@ _prefs: dict[str, Any] | None = None
 _prompt_config: dict[str, Any] | None = None
 
 
+@dataclass
+class CachedPrompt:
+    """A two-part prompt. `cached` is byte-identical across every call that
+    builds it within a run (instructions/schema, or — for CV-matching —
+    the CV itself plus instructions/schema) and is sent with a
+    cache_control breakpoint so Anthropic's prompt cache can reuse it;
+    `variable` is the per-call content (the job ad, the per-job
+    requirements list) appended after it. The cached half MUST come first
+    in the final message — a cache breakpoint only caches a PREFIX, so
+    anything static has to be ordered ahead of anything that changes."""
+
+    cached: str
+    variable: str
+
+    @property
+    def full(self) -> str:
+        return self.cached + self.variable
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.full
+
+
+_CV_COMPRESSION_PROMPT = """You are compressing a candidate's master CV for use as an LLM scoring \
+input, NOT for human reading — the goal is fewer tokens per job scored, with zero loss of \
+anything a scoring model could use as evidence.
+
+Rules, in strict priority order:
+1. Never invent, infer, or alter a fact. Every employer, job title, date range, dollar figure, \
+percentage, qualification and named tool/technology in the input must appear unchanged in the \
+output — copy them verbatim, never paraphrase a number or a name.
+2. Never delete a role, a quantified achievement, or a skill/technology keyword. These are the \
+only things a scoring model can match against job requirements.
+3. You MAY cut: redundant restatements of the same point, generic filler ("results-driven \
+professional"), overly granular day-to-day process description that adds no new fact beyond what's \
+already stated elsewhere, and verbose phrasing that can be shortened without losing a fact.
+4. Older or less senior roles may be compressed harder than recent/primary roles, but every role \
+must still appear with its title, employer and dates.
+5. If the input is already tight with little redundancy, return it close to unchanged — do not cut \
+facts just to hit an arbitrary shorter length.
+
+Return ONLY the compressed CV text. No preamble, no commentary, no markdown code fence, no \
+explanation of what you cut.
+
+<cv>
+{cv_text}
+</cv>"""
+
+
+def _compress_cv_via_claude(full_text: str) -> str:
+    """One-off call (only runs when CV_FULL_PATH's content changes, never
+    per-job) that compresses a freshly-pasted full CV for cheaper per-job
+    CV-matching calls. Same model as production scoring — fidelity matters
+    far more here than cost, since this result becomes the single CV every
+    job gets matched against until the next update."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured — needed to compress the updated CV")
+    client = Anthropic()
+    # 16000, not 4096: adaptive thinking (on by default when `thinking` isn't
+    # set) counts against max_tokens — confirmed live elsewhere in this
+    # codebase that 4096 lets thinking alone consume the whole budget,
+    # leaving stop_reason="max_tokens" and zero actual text. Silent here too:
+    # the `compressed or full_text` fallback below would mask it by quietly
+    # returning the UNCOMPRESSED CV with no error. See CLAUDE_API_COST_NOTES.md.
+    response = client.messages.create(
+        model=MODEL, max_tokens=16000,
+        messages=[{"role": "user", "content": _CV_COMPRESSION_PROMPT.format(cv_text=full_text)}],
+    )
+    compressed = "".join(b.text for b in response.content if b.type == "text").strip()
+    if compressed.startswith("```"):
+        compressed = re.sub(r"^```[a-zA-Z]*\n|```$", "", compressed).strip()
+    return compressed or full_text
+
+
 def _load_cv() -> str:
+    """Loads the CV actually fed to CV-matching. If CV_FULL_PATH exists,
+    treats it as the source of truth: whenever its content changes (tracked
+    by a sha256 sidecar next to CV_PATH), automatically regenerates CV_PATH
+    — compressed via Claude if it's long enough to be worth it, copied
+    through unchanged otherwise — so updating the CV is just overwriting
+    CV_FULL_PATH and nothing else. Without CV_FULL_PATH, CV_PATH is read
+    directly and unmanaged, for backward compatibility."""
     global _cv_text
-    if _cv_text is None:
-        if not CV_PATH.exists():
-            raise RuntimeError(f"CV not found at {CV_PATH} — set CV_PATH in .env")
-        _cv_text = CV_PATH.read_text(encoding="utf-8")
+    if _cv_text is not None:
+        return _cv_text
+
+    if CV_FULL_PATH.exists():
+        full_text = CV_FULL_PATH.read_text(encoding="utf-8")
+        full_hash = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
+        cached_hash = _CV_HASH_PATH.read_text(encoding="utf-8").strip() if _CV_HASH_PATH.exists() else None
+        if cached_hash == full_hash and CV_PATH.exists():
+            _cv_text = CV_PATH.read_text(encoding="utf-8")
+            return _cv_text
+
+        if len(full_text) <= _CV_COMPRESSION_THRESHOLD_CHARS:
+            compressed = full_text
+        else:
+            compressed = _compress_cv_via_claude(full_text)
+        CV_PATH.write_text(compressed, encoding="utf-8")
+        _CV_HASH_PATH.write_text(full_hash, encoding="utf-8")
+        _cv_text = compressed
+        return _cv_text
+
+    if not CV_PATH.exists():
+        raise RuntimeError(f"CV not found at {CV_PATH} — set CV_PATH in .env")
+    _cv_text = CV_PATH.read_text(encoding="utf-8")
     return _cv_text
 
 
@@ -206,29 +317,39 @@ def _validate_quote(quote: str, haystack: str, label: str, min_coverage: float =
 # Pass 1 — job-only, candidate-independent extraction
 # ---------------------------------------------------------------------------
 
-def build_job_extraction_prompt(title: str, company: str, description: str) -> str:
+def build_job_extraction_prompt(title: str, company: str, description: str) -> CachedPrompt:
     """Job ad only — no CV, no candidate preferences, no candidate
     eligibility. This extraction is identical regardless of which profile
-    will eventually be scored against it."""
-    cfg = _load_prompt_config()
-    schema_json = json.dumps(cfg["job_extraction_schema"], indent=2)
-    return f"""{cfg['system_intro']}
+    will eventually be scored against it.
 
-{cfg['untrusted_data_notice']}
-Job title: {title}
-Company: {company}
-Description/alert text: {description[:12000]}
+    Returns a CachedPrompt: system_intro + instructions + schema are
+    identical on every call — this prompt runs on every single job, more
+    than any other pass — so they're the cached prefix. The untrusted-data
+    notice plus the actual job ad text (different every call) is the
+    variable part and comes after, which also means the model sees the
+    full extraction rules before the untrusted content that follows them,
+    not after."""
+    cfg = _load_prompt_config()
+    schema_json = json.dumps(cfg["job_extraction_schema"], separators=(",", ":"))
+    cached = f"""{cfg['system_intro']}
 
 {cfg['job_extraction_instructions']}
 
-Return only a JSON object with exactly this schema:
+Return only a JSON object with exactly this schema. Write it as compact single-line JSON: no indentation, no line breaks between fields, no spaces after colons or commas:
 {schema_json}
 importance, category, role_level_stated, work_arrangement and travel must use exactly one of the \
 listed pipe-separated values each. eligibility_type and timing (inside eligibility_requirements) \
 must use exactly one of the listed pipe-separated values each. years_required, salary_min, \
 salary_max and onsite_days are integers if stated, otherwise null. salary_text and location_text \
-are strings if stated, otherwise null. on_call and contract are booleans.
+are strings if stated, otherwise null. on_call and contract are booleans."""
+    variable = f"""
+
+{cfg['untrusted_data_notice']}
+Job title: {title}
+Company: {company}
+Description/alert text: {description[:12000]}
 """
+    return CachedPrompt(cached, variable)
 
 
 def extract_job_requirements(text: str, title: str, company: str, description: str) -> dict[str, Any]:
@@ -320,7 +441,7 @@ def build_audit_prompt(title: str, company: str, description: str, job_extractio
         indent=2,
     )
     next_id_num = len(job_extraction.get("requirements") or []) + 1
-    schema_json = json.dumps(cfg["audit_schema"], indent=2)
+    schema_json = json.dumps(cfg["audit_schema"], separators=(",", ":"))
     return f"""{cfg['untrusted_data_notice']}
 Job title: {title}
 Company: {company}
@@ -332,7 +453,7 @@ Requirements already extracted:
 {cfg['audit_instructions']}
 Continue requirement_id numbering from R{next_id_num:02d}.
 
-Return only a JSON object with exactly this schema (empty array if nothing is missing):
+Return only a compact single-line JSON object (no indentation, no line breaks, no spaces after colons or commas) with exactly this schema (empty array if nothing is missing):
 {schema_json}
 """
 
@@ -362,39 +483,49 @@ def extract_audit_findings(text: str, title: str, company: str, description: str
 # (skill/experience/qualification — never eligibility, never work_condition)
 # ---------------------------------------------------------------------------
 
-def build_cv_matching_prompt(job_extraction: dict[str, Any]) -> str:
+def build_cv_matching_prompt(job_extraction: dict[str, Any]) -> CachedPrompt:
     """Takes the frozen capability requirements list, NOT the original job
     ad text — the CV-matching model never sees the ad, only what pass 1
     decided was a requirement, so it can't independently discover or invent
     gaps. Eligibility and work-condition requirements are deliberately
     excluded here — eligibility is compared in Python against the
     candidate's own config, and work conditions aren't matched against the
-    CV at all."""
+    CV at all.
+
+    Returns a CachedPrompt: the CV plus instructions/schema are identical
+    on EVERY CV-matching call for this profile until the CV next changes
+    (see _load_cv()) — this is the single biggest recurring cost in the
+    whole pipeline, since the full CV is otherwise re-sent on every job.
+    They're the cached prefix; the per-job role level/family and
+    requirements list are the variable part appended after."""
     cfg = _load_prompt_config()
     requirements = [r for r in (job_extraction.get("requirements") or []) if r["category"] in CAPABILITY_CATEGORIES]
     requirements_json = json.dumps(
         [{k: r[k] for k in ("requirement_id", "requirement", "importance", "category")} for r in requirements],
         indent=2,
     )
-    schema_json = json.dumps(cfg["cv_matching_schema"], indent=2)
+    schema_json = json.dumps(cfg["cv_matching_schema"], separators=(",", ":"))
 
-    return f"""{cfg['untrusted_data_notice']}
-The role is at level "{job_extraction.get('role_level_stated')}" in the "{job_extraction.get('role_family')}" family.
-
-Requirements to evaluate:
-{requirements_json}
-
-<cv>
+    cached = f"""<cv>
 {_load_cv()}
 </cv>
 
 {cfg['cv_matching_instructions']}
 
-Return only a JSON object with exactly this schema:
+Return only a JSON object with exactly this schema. Write it as compact single-line JSON: no indentation, no line breaks between fields, no spaces after colons or commas:
 {schema_json}
 match_state, evidence_depth, scope_match and confidence must use exactly one of the listed \
-pipe-separated values each. Return one entry in "matches" for every requirement_id above.
+pipe-separated values each. Return one entry in "matches" for every requirement_id listed below \
+under "Requirements to evaluate" — no more, no fewer."""
+    variable = f"""
+
+{cfg['untrusted_data_notice']}
+The role is at level "{job_extraction.get('role_level_stated')}" in the "{job_extraction.get('role_family')}" family.
+
+Requirements to evaluate:
+{requirements_json}
 """
+    return CachedPrompt(cached, variable)
 
 
 DEPTH_ALLOWED_BY_STATE = {
@@ -789,8 +920,19 @@ class ParseFailure(RuntimeError):
         self.raw_text = raw_text
 
 
+def _append_retry_hint(prompt: str | CachedPrompt, error: str) -> str | CachedPrompt:
+    """Appends to whatever varies between calls, never to the cached
+    prefix — mutating the cached half would change it from the previous
+    call and guarantee a cache miss on the retry (defeating the whole
+    point, on the one call that's now making a second request anyway)."""
+    hint = _RETRY_HINT.format(error=error)
+    if isinstance(prompt, CachedPrompt):
+        return CachedPrompt(prompt.cached, prompt.variable + hint)
+    return prompt + hint
+
+
 def _call_and_parse(
-    call: Callable[[str], str], prompt: str, parse_fn: Callable[[str], dict[str, Any]],
+    call: Callable[[str | CachedPrompt], str], prompt: str | CachedPrompt, parse_fn: Callable[[str], dict[str, Any]],
     on_step: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Bounded retries on a parse/schema failure. Catches ValueError
@@ -813,7 +955,7 @@ def _call_and_parse(
             return parse_fn(raw)
         except (ValueError, AttributeError, TypeError, KeyError) as exc:
             last_exc = exc
-            current_prompt = prompt + _RETRY_HINT.format(error=f"{type(exc).__name__}: {exc}")
+            current_prompt = _append_retry_hint(prompt, f"{type(exc).__name__}: {exc}")
     raise ParseFailure(f"{_MAX_PARSE_ATTEMPTS} attempts all failed to parse: {last_exc}", last_raw) from last_exc
 
 
@@ -936,15 +1078,106 @@ def _renumber_requirements(requirements: list[dict[str, Any]]) -> list[dict[str,
     return requirements
 
 
+def hard_disqualified_result(job_extraction: dict[str, Any], calls_made: int) -> dict[str, Any] | None:
+    """Eligibility and industry exclusion are both decided entirely from
+    Pass-1 fields (eligibility_requirements, employer_industry) against
+    profile config — no LLM call needed, and the audit pass never adds to
+    either field (it only appends capability requirements). When either
+    one hard-disqualifies the job, the recommendation is already decided
+    regardless of how well the CV matches, so the audit and CV-matching
+    passes — the two most expensive calls — would be pure cost with zero
+    effect on the outcome. Returns the finished result, or None if the job
+    must go on to the remaining passes."""
+    prefs = _load_prefs()
+    eligibility = compute_eligibility(job_extraction.get("eligibility_requirements") or [], prefs.get("eligibility", {}))
+    unmet_eligibility = [k for k, v in eligibility.items() if v == "unmet"]
+    industry_status, industry_label = compute_industry_fit(job_extraction.get("employer_industry"), prefs)
+    if not (unmet_eligibility or industry_status == "excluded"):
+        return None
+    recommendation = "Ineligible" if unmet_eligibility else "Excluded"
+    cap_reasons = (
+        [f"unmet eligibility requirement ({unmet_eligibility[0]}) — job is not applicable regardless of skill fit"]
+        if unmet_eligibility
+        else [f"excluded industry: {industry_label} — job matches an employer type you've asked to exclude, regardless of role fit"]
+    )
+    job_extraction["extraction_stats"] = {
+        "pass1_count": len(job_extraction.get("requirements") or []),
+        "skipped_audit_and_cv_matching": True,
+        "skip_reason": cap_reasons[0],
+    }
+    return {
+        "cv_fit_score": None,
+        "capability_score": None,
+        "salary_fit": None,
+        "location_fit": None,
+        "industry_fit": {"status": industry_status, "label": industry_label},
+        "eligibility": eligibility,
+        "overall_score": None,
+        "recommendation": recommendation,
+        "pitch_angle": "",
+        "gaps": [],
+        "cap_reasons": cap_reasons,
+        "info_flags": ["skipped CV matching — job already disqualified by eligibility or excluded industry"],
+        "preference_fit": {"salary": None, "location": None},
+        "decision_flags": {},
+        "calls_made": calls_made,
+        "job_extraction": job_extraction,
+        "cv_matching": {},
+    }
+
+
+def merge_audit_and_dedupe(job_extraction: dict[str, Any], audit: dict[str, Any] | None) -> set[str]:
+    """Folds the (optional) audit findings into the Pass-1 requirements,
+    dedupes/renumbers them, records extraction_stats, and returns the ids
+    CV-matching must answer for. Shared by run_pipeline and the batch runner."""
+    pre_audit_count = len(job_extraction.get("requirements") or [])
+    audit_added_count = 0
+    audit_fuzzy_quotes: list[str] = []
+    if audit is not None:
+        audit_added_count = len(audit["missing_requirements"])
+        audit_fuzzy_quotes = audit.get("_fuzzy_quotes", [])
+        job_extraction["requirements"] = (job_extraction.get("requirements") or []) + audit["missing_requirements"]
+
+    fuzzy_quotes = job_extraction.pop("_fuzzy_quotes", []) + audit_fuzzy_quotes
+    requirements_no_elig_dupes, eligibility_duplicates_removed = _remove_eligibility_duplicated_work_conditions(
+        job_extraction.get("requirements") or [], job_extraction.get("eligibility_requirements") or []
+    )
+    deduped, importance_conflicts = _dedupe_requirements(requirements_no_elig_dupes)
+    job_extraction["requirements"] = _renumber_requirements(deduped)
+    final_count = len(job_extraction["requirements"])
+    job_extraction["extraction_stats"] = {
+        "pass1_count": pre_audit_count,
+        "audit_added": audit_added_count,
+        "eligibility_duplicates_removed": eligibility_duplicates_removed,
+        "semantic_duplicates_removed": len(requirements_no_elig_dupes) - final_count,
+        "final_count": final_count,
+        "importance_conflicts": importance_conflicts,
+        "extraction_fuzzy_quotes": fuzzy_quotes,
+    }
+    return {r["requirement_id"] for r in job_extraction["requirements"] if r["category"] in CAPABILITY_CATEGORIES}
+
+
+def finish_scoring(job_extraction: dict[str, Any], cv_matching: dict[str, Any], calls_made: int) -> dict[str, Any]:
+    job_extraction["extraction_stats"]["cv_evidence_fuzzy_quotes"] = cv_matching.pop("_fuzzy_evidence", [])
+    result = compute_final_result(job_extraction, cv_matching)
+    result["calls_made"] = calls_made
+    result["job_extraction"] = job_extraction
+    result["cv_matching"] = cv_matching
+    return result
+
+
 def run_pipeline(
-    call: Callable[[str], str], title: str, company: str, description: str, force_audit: bool = False,
+    call: Callable[[str | CachedPrompt], str], title: str, company: str, description: str, force_audit: bool = False,
     on_step: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Runs the full job-extraction → conditional-audit → CV-matching →
     deterministic-scoring pipeline against any provider. `call` is a plain
-    function of (prompt: str) -> str — the only thing that differs between
-    providers. Both score_job() (Anthropic, production) and any comparison
-    script (e.g. against DeepSeek) call this same function, so a difference
+    function of (prompt: str | CachedPrompt) -> str — the only thing that
+    differs between providers. job_extraction/cv_matching prompts are a
+    CachedPrompt (cacheable prefix + variable suffix, see CachedPrompt);
+    the audit prompt is a plain str (too small to benefit from caching).
+    Both score_job() (Anthropic, production) and any comparison script
+    (e.g. against DeepSeek) call this same function, so a difference
     in results can only come from extraction quality, never from different
     scoring logic between providers.
 
@@ -964,10 +1197,23 @@ def run_pipeline(
         on_step,
     )
     calls_made = 1
-    pre_audit_count = len(job_extraction.get("requirements") or [])
-    audit_added_count = 0
-    audit_fuzzy_quotes: list[str] = []
 
+    # Eligibility and industry exclusion are both decided entirely from
+    # Pass-1 fields (eligibility_requirements, employer_industry) against
+    # profile config — no LLM call needed, and the audit pass never adds to
+    # either field (it only appends capability requirements). When either
+    # one hard-disqualifies the job, the recommendation is already decided
+    # regardless of how well the CV matches, so the audit and CV-matching
+    # passes — the two most expensive calls — would be pure cost with zero
+    # effect on the outcome. Short-circuit here instead of running them.
+    if not force_audit:
+        disqualified = hard_disqualified_result(job_extraction, calls_made)
+        if disqualified is not None:
+            if on_step:
+                on_step("Calculating score…")
+            return disqualified
+
+    audit = None
     if force_audit or needs_audit(job_extraction, description):
         if on_step:
             on_step("Double-checking for missed requirements…")
@@ -976,28 +1222,9 @@ def run_pipeline(
             lambda text: extract_audit_findings(text, title, company, description),
             on_step,
         )
-        audit_added_count = len(audit["missing_requirements"])
-        audit_fuzzy_quotes = audit.get("_fuzzy_quotes", [])
-        job_extraction["requirements"] = (job_extraction.get("requirements") or []) + audit["missing_requirements"]
         calls_made += 1
 
-    fuzzy_quotes = job_extraction.pop("_fuzzy_quotes", []) + audit_fuzzy_quotes
-    requirements_no_elig_dupes, eligibility_duplicates_removed = _remove_eligibility_duplicated_work_conditions(
-        job_extraction.get("requirements") or [], job_extraction.get("eligibility_requirements") or []
-    )
-    deduped, importance_conflicts = _dedupe_requirements(requirements_no_elig_dupes)
-    job_extraction["requirements"] = _renumber_requirements(deduped)
-    final_count = len(job_extraction["requirements"])
-    expected_ids = {r["requirement_id"] for r in job_extraction["requirements"] if r["category"] in CAPABILITY_CATEGORIES}
-    job_extraction["extraction_stats"] = {
-        "pass1_count": pre_audit_count,
-        "audit_added": audit_added_count,
-        "eligibility_duplicates_removed": eligibility_duplicates_removed,
-        "semantic_duplicates_removed": len(requirements_no_elig_dupes) - final_count,
-        "final_count": final_count,
-        "importance_conflicts": importance_conflicts,
-        "extraction_fuzzy_quotes": fuzzy_quotes,
-    }
+    expected_ids = merge_audit_and_dedupe(job_extraction, audit)
 
     if on_step:
         on_step("Matching against your CV…")
@@ -1007,20 +1234,72 @@ def run_pipeline(
         on_step,
     )
     calls_made += 1
-    job_extraction["extraction_stats"]["cv_evidence_fuzzy_quotes"] = cv_matching.pop("_fuzzy_evidence", [])
 
     if on_step:
         on_step("Calculating score…")
-    result = compute_final_result(job_extraction, cv_matching)
-    result["calls_made"] = calls_made
-    result["job_extraction"] = job_extraction
-    result["cv_matching"] = cv_matching
-    return result
+    return finish_scoring(job_extraction, cv_matching, calls_made)
 
 
-def _anthropic_call(client: Anthropic, prompt: str, max_tokens: int = 8192) -> str:
-    response = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
+def _thinking_off_param(model: str) -> dict[str, str]:
+    """Every current Claude model runs adaptive (hidden-reasoning) thinking
+    by default when `thinking` is omitted — not "no thinking", like older
+    models. Verified live (2026-10-02) against real job_extraction and
+    cv_matching calls: adaptive thinking added 43-64% MORE output tokens
+    for an IDENTICAL-length JSON result (same schema, same content) — pure
+    overhead on a deterministic extraction/classification task that gains
+    nothing from chain-of-thought. Output tokens are priced 5x input
+    tokens, so this was the single largest line item nobody had measured,
+    since `response.usage` was never logged anywhere in this pipeline.
+    Sonnet 5 accepts {"type": "disabled"} directly; Sonnet 5.5 rejects that
+    (400) and needs {"type": "between_tools"} instead (only valid at
+    effort "high" or below, which is this pipeline's unset/default)."""
+    if model == "claude-sonnet-5-5":
+        return {"type": "between_tools"}
+    return {"type": "disabled"}
+
+
+def _anthropic_call(client: Anthropic, prompt: str | CachedPrompt, max_tokens: int = 8192) -> str:
+    """A CachedPrompt's `cached` half is sent as its own content block with
+    a cache_control breakpoint — Anthropic caches everything up to and
+    including that block (ephemeral, ~5 min TTL) and, on a later call with
+    a byte-identical prefix, charges ~10% of normal input price for it
+    instead of re-billing it in full. `variable` is a second, uncached
+    block appended after. A plain str prompt (the audit pass) is sent as
+    before, uncached."""
+    if isinstance(prompt, CachedPrompt):
+        content = [
+            {"type": "text", "text": prompt.cached, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": prompt.variable},
+        ]
+    else:
+        content = prompt
+    response = client.messages.create(
+        model=MODEL, max_tokens=max_tokens, thinking=_thinking_off_param(MODEL),
+        metadata={"user_id": f"jobsearch-{PROFILE}"},  # lets the Console split spend per profile
+        messages=[{"role": "user", "content": content}],
+    )
+    _log_usage(response.usage)
     return "".join(b.text for b in response.content if b.type == "text")
+
+
+def _log_usage(usage: Any) -> None:
+    """One JSON line per API call in the profile dir — Anthropic's billing
+    ledger isn't reachable from here without an Admin key, and without this
+    there was no way to confirm caching/thinking changes actually moved the
+    bill. Never lets a logging failure break scoring."""
+    try:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "model": MODEL,
+            "input": usage.input_tokens,
+            "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "output": usage.output_tokens,
+        }
+        with (PROFILE_DIR / "api_usage.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
 
 
 def score_job(
