@@ -2,7 +2,7 @@
 
 A personal tool that reads job-alert emails (SEEK, LinkedIn), optionally searches job boards, removes duplicates, and scores each job against your CV with Claude. A small web dashboard lets you review, keep, discard and track applications.
 
-It was built for one household's own job search and runs on a Mac. It is shared as a worked example rather than as a product; expect rough edges (see [Limitations](#limitations)). Developed with AI coding tools.
+It was built for one household's own job search and runs on a Mac. This repository is a mirror: development happens in a private working repo and this copy is regenerated from it with personal details removed, so the history here is a cleaned replay of the original. It is shared as a worked example rather than as a product; expect rough edges (see [Limitations](#limitations)). Developed with AI coding tools.
 
 ## How scoring works
 
