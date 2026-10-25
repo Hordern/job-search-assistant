@@ -228,7 +228,19 @@ def _strip_json_fence(text: str) -> str:
     return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
 
 
+# Job ads (and models quoting them) mix several look-alike hyphens: U+2010
+# hyphen, U+2011 non-breaking hyphen, en/em dashes, minus. A quote that differs
+# from the ad only by one of these is the same text, but difflib treats each as
+# a break, and a short quote like "problem-solving and decision-making skills"
+# then falls under the single-block coverage floor and is rejected with "0%
+# match" - the real cause of several jobs that were given up on as unscorable.
+# Soft hyphens and zero-width characters are invisible, so they are dropped.
+_DASH_VARIANTS = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"), "-")
+_INVISIBLE_CHARS = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\u2060\ufeff"), None)
+
+
 def _normalize_for_quote_match(text: str) -> str:
+    text = text.translate(_DASH_VARIANTS).translate(_INVISIBLE_CHARS)
     text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     return re.sub(r"\s+", " ", text).strip().lower()
 

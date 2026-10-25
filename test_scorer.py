@@ -241,6 +241,26 @@ def test_unknown_preferences_do_not_demote_recommendation():
     assert any("not stated" in f for f in result["info_flags"]), "unknown salary/location should still be visible as an info flag"
 
 
+def test_quote_validation_ignores_lookalike_hyphens():
+    # Real failure (jobs 1084/1319, Oct 2026): the ad used U+2011 non-breaking
+    # hyphens and U+2013 en dashes; the model's quote used plain hyphens. Short
+    # quotes with several of them fell under the coverage floor and the job was
+    # given up on as unscorable.
+    ad = "We need effective problem\u2011solving and decision\u2013making skills. Other duties apply."
+    haystack = scorer._source_haystack("Analyst", "Acme", ad)
+    for quote in (
+        "Effective problem-solving and decision-making skills.",
+        "Effective problem\u2010solving and decision\u2014making skills.",
+    ):
+        assert scorer._validate_quote(quote, haystack, "q") is True, f"look-alike hyphens must match exactly: {quote!r}"
+    try:
+        scorer._validate_quote("Strong Kubernetes and Terraform experience.", haystack, "q")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a genuinely absent quote must still be rejected")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = failed = 0
