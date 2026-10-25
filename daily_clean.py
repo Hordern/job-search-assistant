@@ -161,6 +161,7 @@ def main() -> None:
     }
     report["removed_below_cutoff"] = remove_below_cutoff(cutoff)
     report["unscored"] = handle_unscored()
+    report["ran_at"] = datetime.now(timezone.utc).isoformat()  # finish time, not start
 
     REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
     c, u = report["closed_check"], report["unscored"]
