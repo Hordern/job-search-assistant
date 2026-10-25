@@ -24,3 +24,4 @@ scoring_rules_introspection.txt
 watchdog_state.json
 .batch.lock
 batch_last_error.json
+daily_clean_report.json

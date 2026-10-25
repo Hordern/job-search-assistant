@@ -1,0 +1,18 @@
+{
+  "location": {
+    "home_suburb": "Exampleville, VIC",
+    "great_areas": ["Exampleville"],
+    "max_commute_minutes": 30,
+    "consider_areas": [],
+    "min_wfh_days_for_hybrid_ok": 3
+  },
+  "salary": {
+    "great_floor_aud": 100000,
+    "good_floor_aud": 80000,
+    "consider_floor_aud": 70000
+  },
+  "eligibility": {
+    "drivers_license": {"has": true, "willing_to_obtain": false},
+    "police_check": {"has": false, "willing_to_obtain": true}
+  }
+}

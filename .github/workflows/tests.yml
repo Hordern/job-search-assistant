@@ -1,0 +1,23 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scorer-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # The scoring tests only import anthropic and python-dotenv - not the
+      # full requirements.txt (scrapers, web server) - so CI stays fast.
+      - run: pip install anthropic python-dotenv
+      # users/ci is a dummy profile (no personal data); the real profiles'
+      # CVs and .env files are gitignored and never reach CI.
+      - run: python test_scorer.py
+        env:
+          JOBSEARCH_PROFILE: ci
+          CV_PATH: cv_sample.txt

@@ -1,0 +1,13 @@
+SAMPLE CANDIDATE
+
+Dummy CV used only by the automated tests - it describes no real person.
+
+PROFILE
+IT support generalist with experience across helpdesk, Microsoft 365
+administration, endpoint support and light scripting.
+
+EXPERIENCE
+IT Support Officer, Example Pty Ltd, 2018 - present
+- Administers a Microsoft 365 tenant, user lifecycle and licensing
+- Provides 1st to 3rd line support across macOS and Windows devices
+- Automates reporting with Python and spreadsheets
