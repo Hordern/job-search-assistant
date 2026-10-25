@@ -1,0 +1,90 @@
+{
+  "search_enabled": false,
+  "search_daily_top_n": 3,
+  "batch_scoring": false,
+  "daily_auto_clean": false,
+  "auto_clean_cutoff": 50,
+  "emails_since": null,
+  "location": {
+    "home_suburb": "Exampleville, VIC",
+    "great_areas": [
+      "Exampleville",
+      "Nearbytown"
+    ],
+    "max_commute_minutes": 30,
+    "consider_areas": [
+      "Othertown"
+    ],
+    "min_wfh_days_for_hybrid_ok": 3
+  },
+  "salary": {
+    "current_range_aud": "90000-110000",
+    "great_floor_aud": 100000,
+    "good_floor_aud": 85000,
+    "consider_floor_aud": 70000
+  },
+  "eligibility": {
+    "drivers_license": {
+      "has": true,
+      "willing_to_obtain": false
+    },
+    "working_with_children_check": {
+      "has": false,
+      "willing_to_obtain": true
+    },
+    "police_check": {
+      "has": false,
+      "willing_to_obtain": true
+    }
+  },
+  "industry_preferences": {
+    "exclude": [
+      "Example Industry"
+    ],
+    "downmark": []
+  },
+  "sources": {
+    "seek": {
+      "sender_domains": [
+        "seek.com.au"
+      ]
+    },
+    "linkedin": {
+      "sender_domains": [
+        "linkedin.com"
+      ]
+    }
+  },
+  "connectors": {
+    "seek": {
+      "enabled": true
+    },
+    "linkedin": {
+      "enabled": true,
+      "search_terms": [
+        "Example Role"
+      ],
+      "search_location": "Melbourne, VIC"
+    },
+    "indeed": {
+      "enabled": false,
+      "search_terms": [
+        "Example Role"
+      ],
+      "search_location": "Melbourne, VIC"
+    },
+    "glassdoor": {
+      "enabled": false,
+      "search_terms": [
+        "Example Role"
+      ],
+      "search_location": "Melbourne, VIC"
+    }
+  },
+  "rules_filter": {
+    "exclude_title_keywords": [
+      "internship",
+      "apprentice"
+    ]
+  }
+}
