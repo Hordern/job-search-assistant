@@ -239,7 +239,14 @@ _DASH_VARIANTS = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2
 _INVISIBLE_CHARS = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\u2060\ufeff"), None)
 
 
+# LinkedIn descriptions are fetched as Markdown, so the stored ad literally
+# reads "anti\\-money" and "pre\\-employment" while the model quotes the plain
+# words. Each backslash is a mismatch; two or three in a short quote fail it.
+_MARKDOWN_ESCAPE = re.compile(r"\\([\\\-_*.\[\](){}#+!<>`~|])")
+
+
 def _normalize_for_quote_match(text: str) -> str:
+    text = _MARKDOWN_ESCAPE.sub(r"\1", text)
     text = text.translate(_DASH_VARIANTS).translate(_INVISIBLE_CHARS)
     text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     return re.sub(r"\s+", " ", text).strip().lower()

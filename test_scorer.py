@@ -261,6 +261,15 @@ def test_quote_validation_ignores_lookalike_hyphens():
         raise AssertionError("a genuinely absent quote must still be rejected")
 
 
+def test_quote_validation_ignores_markdown_escapes():
+    # Real failure (jobs 1116/1389, Oct 2026): LinkedIn ads are stored as
+    # Markdown ("anti\\-money", "pre\\-employment"); the model quotes plain text.
+    ad = "These may include a national criminal history check, a anti\\-money laundering (AML) check and pre\\-employment medical assessment."
+    haystack = scorer._source_haystack("Admin", "Acme", ad)
+    quote = "These may include a national criminal history check, a anti-money laundering (AML) check and pre-employment medical assessment."
+    assert scorer._validate_quote(quote, haystack, "q") is True, "markdown backslash escapes must not break an exact quote"
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = failed = 0
