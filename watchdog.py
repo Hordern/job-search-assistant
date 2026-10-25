@@ -47,7 +47,10 @@ LAUNCHD_LABELS = {
     "search-ingest": f"com.example.jobsearch.search-ingest{_SUFFIX}",
     "term-review": f"com.example.jobsearch.term-review{_SUFFIX}",
     "batch-score": f"com.example.jobsearch.batch-score{_SUFFIX}",
+    "daily-clean": f"com.example.jobsearch.daily-clean{_SUFFIX}",
 }
+DAILY_CLEAN_STALE_HOURS = 36  # same threshold the dashboard panel uses
+DAILY_CLEAN_REPORT_PATH = PROFILE_DIR / "daily_clean_report.json"
 BATCH_QUEUE_STUCK_MINUTES = 120  # batches normally finish in minutes, 24h worst case
 BATCH_ERROR_PATH = PROFILE_DIR / "batch_last_error.json"
 
@@ -149,6 +152,22 @@ def _check_batch_api_failing() -> str | None:
     return f"Batch scoring is failing: {err.get('message', 'unknown API error')[:120]}"
 
 
+def _check_daily_clean_stale() -> str | None:
+    """Only meaningful when the profile has daily_auto_clean on."""
+    if not load_prefs().get("daily_auto_clean", False):
+        return None
+    if not DAILY_CLEAN_REPORT_PATH.exists():
+        return "Daily clean is on but has never produced a report."
+    try:
+        ran_at = json.loads(DAILY_CLEAN_REPORT_PATH.read_text(encoding="utf-8"))["ran_at"]
+    except (json.JSONDecodeError, OSError, KeyError):
+        return "Daily clean report is unreadable."
+    hours = _minutes_since(ran_at) / 60
+    if hours > DAILY_CLEAN_STALE_HOURS:
+        return f"Daily clean last ran {hours:.0f}h ago (threshold {DAILY_CLEAN_STALE_HOURS}h)."
+    return None
+
+
 def _check_term_review_stale() -> str | None:
     """term_review.py writes term_suggestions.json on every successful run
     (even its own early-exit "not enough signal yet" path), so staleness
@@ -216,7 +235,8 @@ def main() -> None:
     if scoring_problem:
         problems["scoring_failing"] = scoring_problem
 
-    for key, check in (("batch_queue_stuck", _check_batch_queue_stuck), ("scoring_failing", _check_batch_api_failing)):
+    for key, check in (("batch_queue_stuck", _check_batch_queue_stuck), ("scoring_failing", _check_batch_api_failing),
+                       ("daily_clean_stale", _check_daily_clean_stale)):
         problem = check()
         if problem:
             problems.setdefault(key, problem)

@@ -57,10 +57,21 @@ CREATE TABLE IF NOT EXISTS scoring_queue (
     created_at TEXT NOT NULL
 )"""
 
+# Why a job ended up unscored, kept so daily_clean.py can report a reason
+# instead of just "unscored". gave_up_count caps how often it is retried.
+GAVE_UP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scoring_gave_up (
+    job_id INTEGER PRIMARY KEY,
+    reason TEXT NOT NULL,
+    gave_up_count INTEGER NOT NULL DEFAULT 1,
+    gave_up_at TEXT NOT NULL
+)"""
+
 
 def ensure_schema() -> None:
     with connection() as conn:
         conn.execute(SCHEMA)
+        conn.execute(GAVE_UP_SCHEMA)
 
 
 def enqueue(job_id: int) -> None:
@@ -166,6 +177,12 @@ def _advance(conn, row, job, text: str | None) -> None:
             # Same policy as the synchronous path: stop paying for a job whose
             # content reliably fails to parse; it stays unscored and visible.
             conn.execute("DELETE FROM scoring_queue WHERE job_id = ?", (row["job_id"],))
+            conn.execute(
+                "INSERT INTO scoring_gave_up (job_id, reason, gave_up_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET reason = excluded.reason, "
+                "gave_up_count = gave_up_count + 1, gave_up_at = excluded.gave_up_at",
+                (row["job_id"], f"{stage} pass: {type(exc).__name__}: {exc}"[:300], datetime.now(timezone.utc).isoformat()),
+            )
             print(f"[{PROFILE}] job {row['job_id']} gave up after {attempts} attempts: {exc}")
         else:
             conn.execute(

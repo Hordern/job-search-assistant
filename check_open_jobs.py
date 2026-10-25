@@ -7,17 +7,25 @@ listing page:
   SEEK      closed = the page has no ad body and says "no longer advertised"
   LinkedIn  closed = the guest posting page carries LinkedIn's own closed flag
             ("No longer accepting applications")
-Anything it cannot tell (network error, unexpected page, other sites) is left
-alone and reported as unknown - a wrong "closed" would hide a live job.
+Anything it cannot tell (network error, unexpected page) is left alone and
+reported as unknown - a wrong "closed" would hide a live job. Other sites
+(Indeed, Glassdoor) refuse automated page requests, so they are counted as
+unsupported rather than guessed.
+
+Each result is remembered in job_checks: a job checked in the last
+RECHECK_AFTER_HOURS is not fetched again, and jobs never checked go first -
+so a run that LinkedIn rate-limits part way simply continues next time.
 
 Dry run by default; --apply writes the status changes.
 
 Usage: JOBSEARCH_PROFILE=alice python check_open_jobs.py [--apply]
 """
 
+import collections
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,6 +42,15 @@ HEADERS = {
 SEEK_ID = re.compile(r"/job/(\d+)")
 LINKEDIN_ID = re.compile(r"/jobs/view/(\d+)")
 PAUSE_SECONDS = {"seek": 1, "linkedin": 2}  # be polite; LinkedIn rate-limits quickly
+SUPPORTED_PLATFORMS = set(PAUSE_SECONDS)
+RECHECK_AFTER_HOURS = 18
+
+CHECKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS job_checks (
+    job_id INTEGER PRIMARY KEY,
+    checked_at TEXT NOT NULL,
+    result TEXT NOT NULL            -- open | closed | unknown
+)"""
 
 
 class RateLimited(Exception):
@@ -82,40 +99,73 @@ def is_closed(platform: str, url: str) -> bool | None:
     return None
 
 
-def main() -> None:
-    apply = "--apply" in sys.argv
+def check_all(apply: bool, status_source: str = "job_check", verbose: bool = True) -> dict:
+    """Checks every NEW / TO_PROCESS job; with apply, marks closed ones
+    EXPIRED. Returns counts plus the closed/unknown job rows."""
     with connection() as conn:
+        conn.execute(CHECKS_SCHEMA)
         jobs = conn.execute(
-            "SELECT id, platform, url, title, company FROM jobs WHERE status IN ('NEW', 'TO_PROCESS') ORDER BY id"
+            """
+            SELECT j.id, j.platform, j.url, j.title, j.company, c.checked_at, c.result
+            FROM jobs j LEFT JOIN job_checks c ON c.job_id = j.id
+            WHERE j.status IN ('NEW', 'TO_PROCESS')
+            ORDER BY c.checked_at IS NOT NULL, c.checked_at, j.id
+            """
         ).fetchall()
 
-    closed, open_count, unknown = [], 0, []
-    for job in jobs:
+    fresh_after = (datetime.now(timezone.utc) - timedelta(hours=RECHECK_AFTER_HOURS)).isoformat()
+    report = {"total": len(jobs), "open": 0, "closed": [], "unknown": [], "unsupported": collections.Counter(),
+              "rate_limited": False, "not_reached": 0}
+
+    for index, job in enumerate(jobs):
+        if job["platform"] not in SUPPORTED_PLATFORMS:
+            report["unsupported"][job["platform"]] += 1
+            continue
+        if job["checked_at"] and job["checked_at"] > fresh_after and job["result"] in ("open", "closed"):
+            report["open"] += job["result"] == "open"
+            continue
         try:
             result = is_closed(job["platform"], job["url"] or "")
         except RateLimited:
-            print(f"[{PROFILE}] LinkedIn rate-limited the checker - stopping here; rerun later for the rest.")
+            report["rate_limited"] = True
+            report["not_reached"] = sum(1 for j in jobs[index:] if j["platform"] in SUPPORTED_PLATFORMS)
+            if verbose:
+                print(f"[{PROFILE}] LinkedIn rate-limited the checker - stopping; the rest continue next run.")
             break
-        if result is True:
-            closed.append(job)
-            print(f"closed   {job['id']:>5} {job['platform']:9s} {job['title'][:48]} - {job['company'][:28]}")
-        elif result is False:
-            open_count += 1
-        else:
-            unknown.append(job)
-            print(f"unknown  {job['id']:>5} {job['platform']:9s} {job['title'][:48]}")
-        time.sleep(PAUSE_SECONDS.get(job["platform"], 0))
 
-    if apply and closed:
+        label = "closed" if result is True else "open" if result is False else "unknown"
         with connection() as conn:
-            conn.executemany(
-                "UPDATE jobs SET status = 'EXPIRED', status_source = 'job_check' "
-                "WHERE id = ? AND status IN ('NEW', 'TO_PROCESS')",
-                [(j["id"],) for j in closed],
+            conn.execute(
+                "INSERT INTO job_checks (job_id, checked_at, result) VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET checked_at = excluded.checked_at, result = excluded.result",
+                (job["id"], datetime.now(timezone.utc).isoformat(), label),
             )
-    print(f"\n[{PROFILE}] checked {open_count + len(closed) + len(unknown)} of {len(jobs)}: "
-          f"{open_count} open, {len(closed)} closed{' (marked EXPIRED)' if apply else ' (dry run - use --apply)'}, "
-          f"{len(unknown)} unknown")
+            if label == "closed" and apply:
+                conn.execute(
+                    "UPDATE jobs SET status = 'EXPIRED', status_source = ? WHERE id = ? AND status IN ('NEW', 'TO_PROCESS')",
+                    (status_source, job["id"]),
+                )
+        if label == "closed":
+            report["closed"].append(dict(job))
+            if verbose:
+                print(f"closed   {job['id']:>5} {job['platform']:9s} {job['title'][:48]} - {job['company'][:28]}")
+        elif label == "open":
+            report["open"] += 1
+        else:
+            report["unknown"].append(dict(job))
+            if verbose:
+                print(f"unknown  {job['id']:>5} {job['platform']:9s} {job['title'][:48]}")
+        time.sleep(PAUSE_SECONDS[job["platform"]])
+    return report
+
+
+def main() -> None:
+    apply = "--apply" in sys.argv
+    r = check_all(apply)
+    unsupported = ", ".join(f"{n} {p}" for p, n in r["unsupported"].items()) or "none"
+    print(f"\n[{PROFILE}] {r['total']} jobs: {r['open']} open, {len(r['closed'])} closed"
+          f"{' (marked EXPIRED)' if apply else ' (dry run - use --apply)'}, {len(r['unknown'])} unknown, "
+          f"unsupported sites: {unsupported}" + (f", {r['not_reached']} not reached (rate limited)" if r["rate_limited"] else ""))
 
 
 if __name__ == "__main__":
